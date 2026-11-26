@@ -11,9 +11,11 @@ import {
   visibleWidth,
   wrapAnsiLine,
 } from "../src/ansi.ts";
+import { parseGitPorcelainV2, refreshGitInfoForCwds, type GitCacheEntry } from "../src/git.ts";
 import { parseTerminalInput, toHerdrKeySpec } from "../src/keys.ts";
 import {
   buildDeckAgentItems,
+  collectSnapshotGitCwds,
   resolvePrimaryTitle,
   stripAnsi,
   summarizeScreenLines,
@@ -321,4 +323,146 @@ test("wrapAnsiLine soft-wraps long CJK/ANSI lines while keeping horizontal divid
   const wrappedDivider = wrapAnsiLine(divider, 40);
   assert.equal(wrappedDivider.length, 1);
   assert.equal(visibleWidth(wrappedDivider[0]!), 40);
+});
+
+test("git porcelain v2 parser, TTL cache, and UI rendering replace paneId with git status", async () => {
+  const parsed = parseGitPorcelainV2(
+    [
+      "# branch.oid 1234567890abcdef1234567890abcdef12345678",
+      "# branch.head feat/git-status",
+      "# branch.upstream origin/feat/git-status",
+      "# branch.ab +2 -1",
+      "1 .M N... 100644 100644 100644 aaaa bbbb src/render.ts",
+      "2 R. N... 100644 100644 100644 aaaa bbbb R100 src/new.ts\tsrc/old.ts",
+      "? src/untracked.ts",
+    ].join("\n"),
+  );
+  assert.deepEqual(parsed, {
+    branch: "feat/git-status",
+    dirtyFiles: 3,
+    ahead: 2,
+    behind: 1,
+    detached: false,
+  });
+
+  const detached = parseGitPorcelainV2(
+    "# branch.oid abcdef1234567890\n# branch.head (detached)\n",
+  );
+  assert.deepEqual(detached, {
+    branch: "abcdef1",
+    dirtyFiles: 0,
+    ahead: 0,
+    behind: 0,
+    detached: true,
+  });
+  assert.equal(parseGitPorcelainV2("fatal: not a git repository"), null);
+
+  // Deduplication + TTL cache check
+  const cache = new Map<string, GitCacheEntry>();
+  let probeCount = 0;
+  const fakeProbe = async (cwd: string) => {
+    probeCount += 1;
+    return cwd === "/repo/a" ? parsed : null;
+  };
+  const first = await refreshGitInfoForCwds(["/repo/a", "/repo/a", "/non-git"], cache, {
+    nowMs: 1000,
+    ttlMs: 5000,
+    probe: fakeProbe,
+  });
+  assert.equal(first.changed, true);
+  assert.equal(probeCount, 2);
+
+  // Within TTL: no extra probes
+  const second = await refreshGitInfoForCwds(["/repo/a", "/non-git"], cache, {
+    nowMs: 3000,
+    ttlMs: 5000,
+    probe: fakeProbe,
+  });
+  assert.equal(second.changed, false);
+  assert.equal(probeCount, 2);
+
+  // Build snapshot with git repo and non-git workspace cwds
+  const snap: SessionSnapshot = {
+    version: "0.9.5",
+    protocol: 22,
+    workspaces: [
+      {
+        workspace_id: "w1",
+        number: 1,
+        label: "repo-ws",
+        focused: true,
+        pane_count: 1,
+        tab_count: 1,
+        active_tab_id: "w1:t1",
+        agent_status: "idle",
+      },
+      {
+        workspace_id: "w2",
+        number: 2,
+        label: "plain-ws",
+        focused: false,
+        pane_count: 1,
+        tab_count: 1,
+        active_tab_id: "w2:t1",
+        agent_status: "idle",
+      },
+    ],
+    tabs: [
+      { tab_id: "w1:t1", workspace_id: "w1", number: 1, label: "main", focused: true, pane_count: 1, agent_status: "idle" },
+      { tab_id: "w2:t1", workspace_id: "w2", number: 1, label: "main", focused: false, pane_count: 1, agent_status: "idle" },
+    ],
+    panes: [
+      { pane_id: "w1:p1", terminal_id: "t1", workspace_id: "w1", tab_id: "w1:t1", focused: true, revision: 1, cwd: "/repo/a", agent_status: "idle" },
+      { pane_id: "w2:p1", terminal_id: "t2", workspace_id: "w2", tab_id: "w2:t1", focused: false, revision: 1, cwd: "/non-git", agent_status: "idle" },
+    ],
+    agents: [
+      { pane_id: "w1:p1", terminal_id: "t1", workspace_id: "w1", tab_id: "w1:t1", focused: true, revision: 1, cwd: "/repo/a", agent: "claude", agent_status: "idle" },
+      { pane_id: "w2:p1", terminal_id: "t2", workspace_id: "w2", tab_id: "w2:t1", focused: false, revision: 1, cwd: "/non-git", agent: "agy", agent_status: "idle" },
+    ],
+  };
+
+  assert.deepEqual(collectSnapshotGitCwds(snap).sort(), ["/non-git", "/repo/a"]);
+
+  const gitMap = new Map(
+    [...cache.entries()].map(([k, v]) => [k, v.info]),
+  );
+  const items = buildDeckAgentItems(snap, createEmptyState(), new Map(), null, 5000, gitMap);
+  assert.equal(items[0]!.gitInfo?.branch, "feat/git-status");
+  assert.equal(items[1]!.gitInfo, null);
+
+  // Render IDLE items: git repo shows branch + dirty + ahead/behind, paneId (w1:p1 / w2:p1) is never shown
+  const cols = 112;
+  const rows = 20;
+  const frame = renderScreen({
+    cols,
+    rows,
+    items,
+    selectedPaneId: "w1:p1",
+    focusMode: "list",
+    filterTab: "all",
+    showIdle: true,
+    showHelp: false,
+    previewText: "Ready.",
+    replyDraft: "",
+    replyCursor: 0,
+    renameDraft: "",
+    renameCursor: 0,
+    toastMessage: null,
+    toastKind: "info",
+    spinnerTick: 0,
+    nowMs: 5000,
+  });
+
+  const plainLines = [...frame.matchAll(/\x1b\[(\d+);1H([\s\S]*?)\x1b\[K/g)].map((m) =>
+    stripAnsi(m[2]!),
+  );
+  assert.equal(plainLines.length, rows);
+  for (const [idx, line] of plainLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `row ${idx} width mismatch: "${line}"`);
+  }
+  const plainAll = plainLines.join("\n");
+  assert.ok(!plainAll.includes("w1:p1"), "expected w1:p1 to be removed from UI");
+  assert.ok(!plainAll.includes("w2:p1"), "expected w2:p1 to be removed from UI");
+  assert.ok(plainAll.includes("⎇ feat/git-status *3 ↑2 ↓1"), "expected full git status in preview header");
+  assert.ok(plainAll.includes("*3 ↑2 ↓1"), "expected git dirty/ahead/behind counters in IDLE row");
 });

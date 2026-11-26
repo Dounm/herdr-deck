@@ -1,5 +1,6 @@
+import { refreshGitInfoForCwds, type GitCacheEntry } from "./git.ts";
 import { parseTerminalInput, type ParsedKey } from "./keys.ts";
-import { buildDeckAgentItems } from "./model.ts";
+import { buildDeckAgentItems, collectSnapshotGitCwds } from "./model.ts";
 import { getVisibleItems, renderScreen, type FilterTab, type RenderState, type UiFocusMode } from "./render.ts";
 import { HerdrRpcError, HerdrSocketClient } from "./socket-client.ts";
 import {
@@ -9,7 +10,7 @@ import {
   recordAgentStatusTransition,
   saveDeckState,
 } from "./state.ts";
-import type { AgentStatus, DeckAgentItem, PersistedDeckState, SessionSnapshot } from "./types.ts";
+import type { AgentStatus, DeckAgentItem, GitRepoInfo, PersistedDeckState, SessionSnapshot } from "./types.ts";
 
 const GLOBAL_SUBSCRIPTIONS = [
   { type: "workspace.created" },
@@ -55,6 +56,9 @@ export async function runTuiApp(): Promise<void> {
   const snippetsByPane = new Map<string, string>();
   const previewCache = new Map<string, string>();
   const lastFetchedRevision = new Map<string, number>();
+  const gitCache = new Map<string, GitCacheEntry>();
+  const gitInfoByCwd = new Map<string, GitRepoInfo | null>();
+  let gitRefreshInFlight = false;
 
   let items: DeckAgentItem[] = [];
   let selectedPaneId: string | null = null;
@@ -136,6 +140,33 @@ export async function runTuiApp(): Promise<void> {
     });
   };
 
+  const rebuildItemsFromSnapshot = () => {
+    if (!snapshot) return;
+    items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId, Date.now(), gitInfoByCwd);
+  };
+
+  const triggerGitRefresh = (force = false) => {
+    if (!snapshot || gitRefreshInFlight || exiting) return;
+    const cwds = collectSnapshotGitCwds(snapshot, selfPaneId);
+    if (cwds.length === 0) return;
+
+    gitRefreshInFlight = true;
+    void refreshGitInfoForCwds(cwds, gitCache, { force })
+      .then(({ changed }) => {
+        if (exiting) return;
+        for (const [cwd, entry] of gitCache) {
+          gitInfoByCwd.set(cwd, entry.info);
+        }
+        if (changed && snapshot) {
+          rebuildItemsFromSnapshot();
+          scheduleRender();
+        }
+      })
+      .finally(() => {
+        gitRefreshInFlight = false;
+      });
+  };
+
   const fetchPreviewForPane = async (targetPaneId: string, seq: number) => {
     try {
       const readRes = await client.readPane(targetPaneId, {
@@ -159,10 +190,7 @@ export async function runTuiApp(): Promise<void> {
       const previewChanged = previewText !== readRes.text;
       previewText = readRes.text;
 
-      if (snapshot) {
-        const nextItems = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
-        items = nextItems;
-      }
+      rebuildItemsFromSnapshot();
       if (previewChanged) {
         scheduleRender();
       }
@@ -256,7 +284,7 @@ export async function runTuiApp(): Promise<void> {
 
       await refreshSnippetsForPriorityAgents(snap);
 
-      items = buildDeckAgentItems(snap, persisted, snippetsByPane, selfPaneId);
+      rebuildItemsFromSnapshot();
 
       const vis = getCurrentVisible();
       if (!preserveSelection || !selectedPaneId || !vis.some((x) => x.paneId === selectedPaneId)) {
@@ -270,6 +298,7 @@ export async function runTuiApp(): Promise<void> {
 
       scheduleRender();
       requestSelectedPreview(0);
+      triggerGitRefresh(false);
     } catch (err) {
       setToast(
         `无法读取 Herdr 状态: ${err instanceof Error ? err.message : String(err)}`,
@@ -507,7 +536,7 @@ export async function runTuiApp(): Promise<void> {
         if (targetPane) {
           targetPane.label = nextLabel;
         }
-        items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
+        rebuildItemsFromSnapshot();
       }
       setToast(
         nextLabel ? `已重命名为「${nextLabel}」` : "已清除自定义 Pane 名称",
@@ -533,9 +562,7 @@ export async function runTuiApp(): Promise<void> {
       revision: sel.revision,
     });
     saveDeckState(persisted);
-    if (snapshot) {
-      items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
-    }
+    rebuildItemsFromSnapshot();
     setToast(`已将 ${sel.primaryTitle} 标记为已审阅`, "ok", 1800);
     advanceToNextAttentionItem(sel.paneId);
     scheduleRender();
@@ -592,6 +619,7 @@ export async function runTuiApp(): Promise<void> {
       }
       if (key.key === "r") {
         await refreshSnapshot(true);
+        triggerGitRefresh(true);
         setToast("已刷新全部 Agent 状态", "info", 1400);
         return;
       }
@@ -887,5 +915,7 @@ export async function runTuiApp(): Promise<void> {
     } else if (hasActiveTimers && !showHelp) {
       scheduleRender();
     }
+
+    triggerGitRefresh(false);
   }, 900);
 }

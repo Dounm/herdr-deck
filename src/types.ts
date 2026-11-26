@@ -127,6 +127,14 @@ export interface PersistedDeckState {
 
 export type AttentionGroup = "needs_you" | "review" | "working" | "idle";
 
+export interface GitRepoInfo {
+  branch: string;
+  dirtyFiles: number;
+  ahead: number;
+  behind: number;
+  detached?: boolean;
+}
+
 export interface DeckAgentItem {
   paneId: string;
   workspaceId: string;
@@ -137,6 +145,7 @@ export interface DeckAgentItem {
   paneLabel?: string | null;
   primaryTitle: string;
   branch?: string | null;
+  gitInfo?: GitRepoInfo | null;
   cwd?: string | null;
   agentKind: string;
   agentDisplayName: string;

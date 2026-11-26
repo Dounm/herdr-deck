@@ -14,7 +14,7 @@ import {
   wrapAnsiLine,
 } from "./ansi.ts";
 import { formatDurationCompact, formatRelativeAge } from "./state.ts";
-import type { AttentionGroup, DeckAgentItem } from "./types.ts";
+import type { AttentionGroup, DeckAgentItem, GitRepoInfo } from "./types.ts";
 
 export type UiFocusMode = "list" | "reply" | "rename";
 export type FilterTab = "all" | "attention" | "working";
@@ -326,6 +326,53 @@ function renderAgentListInner(
   return out;
 }
 
+function renderGitBadge(
+  gitInfo: GitRepoInfo | null | undefined,
+  fallbackBranch: string | null | undefined,
+  options: { rowBg?: string; maxCols?: number; includeBranch?: boolean } = {},
+): string {
+  const bg = options.rowBg ?? "";
+  const includeBranch = options.includeBranch ?? true;
+  const info: GitRepoInfo | null =
+    gitInfo ??
+    (fallbackBranch ? { branch: fallbackBranch, dirtyFiles: 0, ahead: 0, behind: 0 } : null);
+  if (!info) return "";
+
+  const statusParts: string[] = [];
+  if (info.dirtyFiles > 0) {
+    statusParts.push(`${bg}${GRUVBOX.yellow}*${info.dirtyFiles}${RESET}`);
+  }
+  if (info.ahead > 0) {
+    statusParts.push(`${bg}${GRUVBOX.green}↑${info.ahead}${RESET}`);
+  }
+  if (info.behind > 0) {
+    statusParts.push(`${bg}${GRUVBOX.red}↓${info.behind}${RESET}`);
+  }
+  const statusStr = statusParts.join(`${bg} `);
+
+  if (!includeBranch) {
+    return statusStr;
+  }
+
+  const branchPrefix = `${bg}${GRUVBOX.aqua}⎇ `;
+  const statusCols = statusStr ? visibleWidth(statusStr) + 1 : 0;
+  let branchText = info.branch;
+
+  if (options.maxCols !== undefined) {
+    const branchBudget = options.maxCols - 2 - statusCols;
+    if (branchBudget >= 4) {
+      branchText = fitAnsiColumns(info.branch, branchBudget, { ellipsis: "…" });
+    } else if (statusStr && visibleWidth(statusStr) <= options.maxCols) {
+      return statusStr;
+    } else {
+      return fitAnsiColumns(`${branchPrefix}${info.branch}${RESET}`, options.maxCols, { ellipsis: "…" });
+    }
+  }
+
+  const branchRendered = `${branchPrefix}${branchText}${RESET}`;
+  return statusStr ? `${branchRendered}${bg} ${statusStr}` : branchRendered;
+}
+
 function renderAgentCardRows(
   state: RenderState,
   item: DeckAgentItem,
@@ -343,25 +390,41 @@ function renderAgentCardRows(
   const spin = SPINNER_FRAMES[state.spinnerTick % SPINNER_FRAMES.length]!;
   let icon = "○";
   let iconColor: string = GRUVBOX.gray;
-  let timerStr = "";
+  let rightRendered = "";
+  let rightCols = 0;
 
   const elapsed = Math.max(0, state.nowMs - item.sinceMs);
   if (item.group === "needs_you") {
     icon = "!";
     iconColor = GRUVBOX.red;
-    timerStr = `⚑ ${formatDurationCompact(elapsed)}`;
+    const timerStr = `⚑ ${formatDurationCompact(elapsed)}`;
+    rightRendered = `${rowBg}${BOLD}${GRUVBOX.orange}${timerStr} ${RESET}`;
+    rightCols = visibleWidth(timerStr) + 1;
   } else if (item.group === "review") {
     icon = "✓";
     iconColor = GRUVBOX.green;
-    timerStr = formatRelativeAge(elapsed);
+    const timerStr = formatRelativeAge(elapsed);
+    rightRendered = `${rowBg}${GRUVBOX.green}${timerStr} ${RESET}`;
+    rightCols = visibleWidth(timerStr) + 1;
   } else if (item.group === "working") {
     icon = spin;
     iconColor = GRUVBOX.yellow;
-    timerStr = `↻ ${formatDurationCompact(elapsed)}`;
+    const timerStr = `↻ ${formatDurationCompact(elapsed)}`;
+    rightRendered = `${rowBg}${GRUVBOX.yellow}${timerStr} ${RESET}`;
+    rightCols = visibleWidth(timerStr) + 1;
   } else {
     icon = "○";
     iconColor = GRUVBOX.gray;
-    timerStr = item.paneId;
+    const maxGitCols = Math.max(8, Math.floor(width * 0.48));
+    const gitBadge = renderGitBadge(item.gitInfo, item.branch, {
+      rowBg,
+      maxCols: maxGitCols,
+      includeBranch: true,
+    });
+    if (gitBadge) {
+      rightRendered = `${gitBadge}${rowBg} ${RESET}`;
+      rightCols = visibleWidth(gitBadge) + 1;
+    }
   }
 
   // Distinct deterministic color per primaryTitle so multiple agents in one workspace stand out immediately
@@ -369,32 +432,27 @@ function renderAgentCardRows(
   const titleStyle = isSelected ? `${BOLD}${nameColor}` : nameColor;
   const currentDot = item.focusedInHerdr ? `${rowBg}${GRUVBOX.fg3} •${RESET}` : "";
 
-  const timerColor =
-    item.group === "needs_you"
-      ? `${BOLD}${GRUVBOX.orange}`
-      : item.group === "working"
-        ? GRUVBOX.yellow
-        : item.group === "review"
-          ? GRUVBOX.green
-          : GRUVBOX.gray;
-
-  const timerRendered = `${rowBg}${timerColor}${timerStr} ${RESET}`;
-  const timerCols = visibleWidth(timerStr) + 1;
-  const leftBudget = Math.max(8, width - timerCols - 1);
-
   const leftHeadline =
     `${cursorBar}${rowBg}${iconColor}${BOLD}${icon}${RESET}` +
     `${rowBg} ${titleStyle}${item.primaryTitle}${RESET}${currentDot}`;
 
-  const fittedLeft = fitAnsiColumns(leftHeadline, leftBudget, {
-    pad: true,
-    padBg: rowBg || undefined,
-  });
-
-  const line1 = fitAnsiColumns(`${fittedLeft} ${timerRendered}`, width, {
-    pad: true,
-    padBg: rowBg || undefined,
-  });
+  let line1: string;
+  if (rightRendered) {
+    const leftBudget = Math.max(8, width - rightCols - 1);
+    const fittedLeft = fitAnsiColumns(leftHeadline, leftBudget, {
+      pad: true,
+      padBg: rowBg || undefined,
+    });
+    line1 = fitAnsiColumns(`${fittedLeft} ${rightRendered}`, width, {
+      pad: true,
+      padBg: rowBg || undefined,
+    });
+  } else {
+    line1 = fitAnsiColumns(leftHeadline, width, {
+      pad: true,
+      padBg: rowBg || undefined,
+    });
+  }
 
   // Line 2: compact meta (`workspace · agent`) + cleaned summary
   const subPrefix = isSelected
@@ -465,18 +523,28 @@ function renderPreviewCard(
 
   if (selected) {
     const titleColor = pickNameColor(selected.primaryTitle);
-    const branchPart = selected.branch ? ` ${GRUVBOX.aqua}⎇ ${selected.branch}${RESET}` : "";
+    const gitBadge = renderGitBadge(selected.gitInfo, selected.branch, { includeBranch: true });
     const cwdPart = selected.cwd ? ` ${GRUVBOX.gray}${shortenHome(selected.cwd)}${RESET}` : "";
-    headerTitle =
+    const baseTitle =
       `${titleColor}${BOLD}${selected.primaryTitle}${RESET}` +
-      `${GRUVBOX.gray} · ${GRUVBOX.fg3}${selected.workspaceLabel} › ${selected.tabLabel} › ${GRUVBOX.yellow}${selected.agentDisplayName}${RESET}` +
-      branchPart +
-      (width >= 88 ? cwdPart : "");
+      `${GRUVBOX.gray} · ${GRUVBOX.fg3}${selected.workspaceLabel} › ${selected.tabLabel} › ${GRUVBOX.yellow}${selected.agentDisplayName}${RESET}`;
 
     if (isBlocked) {
+      const branchPart = gitBadge ? ` ${gitBadge}` : "";
+      headerTitle = baseTitle + branchPart + (width >= 88 ? cwdPart : "");
       rightTag = `${GRUVBOX.bgUrgent}${GRUVBOX.red}${BOLD} ! 待审批 ${RESET}`;
     } else {
-      rightTag = `${GRUVBOX.gray}${selected.paneId}${RESET}`;
+      const maxGitCols = Math.max(12, Math.floor(width * 0.42));
+      const fittedGitBadge = renderGitBadge(selected.gitInfo, selected.branch, {
+        maxCols: maxGitCols,
+        includeBranch: true,
+      });
+      const canShowCwd =
+        width >= 88 &&
+        visibleWidth(baseTitle + cwdPart) + (fittedGitBadge ? visibleWidth(fittedGitBadge) + 6 : 0) <=
+          width - 6;
+      headerTitle = baseTitle + (canShowCwd ? cwdPart : "");
+      rightTag = fittedGitBadge;
     }
   }
 

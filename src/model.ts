@@ -3,6 +3,7 @@ import type {
   AgentStatus,
   AttentionGroup,
   DeckAgentItem,
+  GitRepoInfo,
   PaneInfo,
   PersistedDeckState,
   SessionSnapshot,
@@ -248,12 +249,54 @@ function cleanSingleLine(input: string): string {
   return stripAnsi(input).replace(/\s+/g, " ").trim();
 }
 
+export function resolveAgentCwd(
+  agent: Pick<AgentInfo, "foreground_cwd" | "cwd">,
+  pane: Pick<PaneInfo, "foreground_cwd" | "cwd"> | undefined,
+  workspace: Pick<WorkspaceInfo, "worktree"> | undefined,
+): string | null {
+  return (
+    agent.foreground_cwd ??
+    agent.cwd ??
+    pane?.foreground_cwd ??
+    pane?.cwd ??
+    workspace?.worktree?.path ??
+    null
+  );
+}
+
+export function collectSnapshotGitCwds(
+  snapshot: SessionSnapshot,
+  excludePaneId?: string | null,
+): string[] {
+  const workspacesById = new Map<string, WorkspaceInfo>(
+    snapshot.workspaces.map((w) => [w.workspace_id, w]),
+  );
+  const panesById = new Map<string, PaneInfo>(
+    snapshot.panes.map((p) => [p.pane_id, p]),
+  );
+
+  const cwds = new Set<string>();
+  for (const agent of snapshot.agents) {
+    if (excludePaneId && agent.pane_id === excludePaneId) continue;
+    const cwd = resolveAgentCwd(
+      agent,
+      panesById.get(agent.pane_id),
+      workspacesById.get(agent.workspace_id),
+    );
+    if (cwd) {
+      cwds.add(cwd);
+    }
+  }
+  return [...cwds];
+}
+
 export function buildDeckAgentItems(
   snapshot: SessionSnapshot,
   state: PersistedDeckState,
   snippetsByPane: ReadonlyMap<string, string> = new Map(),
   excludePaneId?: string | null,
   nowMs = Date.now(),
+  gitInfoByCwd?: ReadonlyMap<string, GitRepoInfo | null>,
 ): DeckAgentItem[] {
   const workspacesById = new Map<string, WorkspaceInfo>(
     snapshot.workspaces.map((w) => [w.workspace_id, w]),
@@ -290,8 +333,16 @@ export function buildDeckAgentItems(
       pane?.display_agent ??
       agentKind;
 
-    const branch = ws?.worktree?.branch ?? ws?.tokens?.branch ?? null;
-    const cwd = agent.foreground_cwd ?? agent.cwd ?? pane?.foreground_cwd ?? pane?.cwd ?? null;
+    const cwd = resolveAgentCwd(agent, pane, ws);
+    const fallbackBranch = ws?.worktree?.branch ?? ws?.tokens?.branch ?? null;
+    const hasProbed = Boolean(cwd && gitInfoByCwd?.has(cwd));
+    const probedGit = hasProbed && cwd ? (gitInfoByCwd!.get(cwd) ?? null) : null;
+    const gitInfo: GitRepoInfo | null =
+      probedGit ??
+      (!hasProbed && fallbackBranch
+        ? { branch: fallbackBranch, dirtyFiles: 0, ahead: 0, behind: 0 }
+        : null);
+    const branch = gitInfo?.branch ?? null;
     const workspaceLabel = ws?.label ?? agent.workspace_id;
     const paneLabel = pane?.label?.trim() || null;
     const primaryTitle = resolvePrimaryTitle(agent, pane, workspaceLabel, cwd);
@@ -306,6 +357,7 @@ export function buildDeckAgentItems(
       paneLabel,
       primaryTitle,
       branch,
+      gitInfo,
       cwd,
       agentKind,
       agentDisplayName,

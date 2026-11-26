@@ -10,7 +10,7 @@
 
 ```text
  ◈ HERDR DECK   ! 1 待审批   ✓ 1 待审阅   ⠋ 2 运行中   ○ 3 空闲                  [f] 全部
-╭─ Agent 队列 ──────────────── 7/7 ─╮╭─ herdr plugin · misc › 3 › agy ⎇ main ──── w3:pE ─╮
+╭─ Agent 队列 ──────────────── 7/7 ─╮╭─ herdr plugin · misc › 3 › agy ──── ⎇ main *2 ↑1 ─╮
 │ ─ ! NEEDS YOU (1) ─────────────── ││  已完成单测与打包，准备执行以下迁移命令：          │
 │ ▌! dsh-launcher           ⚑ 01:24 ││                                                   │
 │ ▌  claude │ Allow Bash: migrate?  ││  ╭─ Permission Required ────────────────────────╮ │
@@ -22,6 +22,10 @@
 │ ─ ↻ WORKING (2) ───────────────── │╭─ 快速审批 / 回复 ────── [y/n/1-4] 审批 · [Enter] ─╮
 │  ⠋ herdr plugin           ↻ 03:18 ││ ❯ 按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项        │
 │    misc·agy │ 正在构建单文件产物  │╰───────────────────────────────────────────────────╯
+│                                   │
+│ ─ ○ IDLE (3) ──────────────────── │
+│  ○ dotfiles          ⎇ main *1 ↑1 │
+│    personal·agy │ Idle at prompt  │
 ╰───────────────────────────────────╯
  [j/k] 切换  [Enter] 进入终端  [r] 回复  [y/n] 审批  [m] 已阅  [?] 全部快捷键
 ```
