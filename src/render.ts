@@ -9,9 +9,9 @@ import {
   renderBoxRow,
   renderBoxTop,
   RESET,
-  sanitizePreviewAnsiLine,
   style,
   visibleWidth,
+  wrapAnsiLine,
 } from "./ansi.ts";
 import { formatDurationCompact, formatRelativeAge } from "./state.ts";
 import type { AttentionGroup, DeckAgentItem } from "./types.ts";
@@ -511,18 +511,24 @@ function renderPreviewCard(
     return out;
   }
 
-  // Always show the latest bottom lines (no preview scrolling; press Enter to scroll in real terminal)
-  const startIdx = Math.max(0, rawLines.length - innerHeight);
-  const slice = rawLines.slice(startIdx);
+  // Soft-wrap every logical line to fit the right preview card cleanly (preserving ANSI styles)
   const contentCols = Math.max(2, innerWidth - 2);
+  const wrappedLines: string[] = [];
+  for (const raw of rawLines) {
+    const pieces = wrapAnsiLine(raw, contentCols);
+    wrappedLines.push(...pieces);
+  }
+
+  // Always show the latest bottom visual lines (press Enter to scroll full history in real terminal)
+  const startIdx = Math.max(0, wrappedLines.length - innerHeight);
+  const slice = wrappedLines.slice(startIdx);
 
   for (let i = 0; i < innerHeight; i++) {
-    const raw = slice[i];
-    if (raw === undefined) {
+    const line = slice[i];
+    if (line === undefined) {
       out.push(renderBoxRow("", width, borderColor));
     } else {
-      const safe = sanitizePreviewAnsiLine(raw);
-      const fitted = fitAnsiColumns(safe, contentCols, { pad: true, ellipsis: "…" });
+      const fitted = fitAnsiColumns(line, contentCols, { pad: true, ellipsis: "" });
       out.push(renderBoxRow(` ${fitted} `, width, borderColor));
     }
   }

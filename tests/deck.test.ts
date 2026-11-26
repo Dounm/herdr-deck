@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { fitAnsiColumns, pickNameColor, sanitizePreviewAnsiLine, visibleWidth } from "../src/ansi.ts";
+import {
+  fitAnsiColumns,
+  pickNameColor,
+  sanitizePreviewAnsiLine,
+  visibleWidth,
+  wrapAnsiLine,
+} from "../src/ansi.ts";
 import { parseTerminalInput, toHerdrKeySpec } from "../src/keys.ts";
 import {
   buildDeckAgentItems,
@@ -279,4 +285,23 @@ test("key parser handles arrows, CJK UTF-8 characters, and Herdr key specs", () 
   ]);
   assert.equal(toHerdrKeySpec(events[0]!), "up");
   assert.equal(toHerdrKeySpec(events[3]!), "enter");
+});
+
+test("wrapAnsiLine soft-wraps long CJK/ANSI lines while keeping horizontal dividers on one line", () => {
+  // Colored long CJK + ASCII line wraps across multiple visual rows and carries SGR color forward
+  const colored = "\x1b[38;5;12m你好世界HelloWorld测试换行效果\x1b[0m";
+  const wrapped = wrapAnsiLine(colored, 12);
+  assert.ok(wrapped.length >= 3, `expected >= 3 wrapped lines, got ${wrapped.length}`);
+  for (const row of wrapped) {
+    assert.ok(visibleWidth(row) <= 12, `wrapped row exceeded 12 cols: "${stripAnsi(row)}"`);
+  }
+  assert.equal(wrapped.map((r) => stripAnsi(r)).join(""), "你好世界HelloWorld测试换行效果");
+  // Continuation line preserves ANSI color escape
+  assert.ok(wrapped[1]!.startsWith("\x1b[38;5;12m"));
+
+  // Horizontal rule stays clipped to a single neat line instead of wrapping into multiple rows
+  const divider = "\x1b[38;5;8m" + "─".repeat(160) + "\x1b[0m";
+  const wrappedDivider = wrapAnsiLine(divider, 40);
+  assert.equal(wrappedDivider.length, 1);
+  assert.equal(visibleWidth(wrappedDivider[0]!), 40);
 });

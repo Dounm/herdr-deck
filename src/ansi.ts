@@ -365,3 +365,115 @@ export function layoutEditableInput(
     cursorCellOffset,
   };
 }
+
+/**
+ * Wrap a single sanitized ANSI SGR line into visual lines of at most `maxCols` display cells.
+ * - Preserves active ANSI SGR color/style across wrapped lines cleanly.
+ * - Keeps pure horizontal divider lines (e.g. `──────`) trimmed to 1 neat line instead of wrapping into 2 ugly lines.
+ * - Trims trailing whitespace padding that terminal emulators emit on full-width lines.
+ */
+export function wrapAnsiLine(rawLine: string, maxCols: number): string[] {
+  if (maxCols <= 0) return [""];
+
+  const clean = sanitizePreviewAnsiLine(rawLine);
+  const plainTrimmedRight = clean.replace(TOKEN_REGEX, "").replace(/\s+$/, "");
+
+  // Empty / whitespace-only line -> single empty line
+  if (plainTrimmedRight.length === 0) {
+    return [""];
+  }
+
+  // Pure horizontal rule / box divider (e.g. Claude/Agy 185-col `─────` separators) -> clip to 1 row cleanly
+  const plainTrimmed = plainTrimmedRight.trim();
+  if (plainTrimmed.length >= 4 && /^[─━═┄┅┈┉\-_=]+$/.test(plainTrimmed)) {
+    return [fitAnsiColumns(clean, maxCols, { ellipsis: "" })];
+  }
+
+  // Fast path: already fits within maxCols
+  if (visibleWidth(plainTrimmedRight) <= maxCols) {
+    return [fitAnsiColumns(trimTrailingSpacesAnsi(clean), maxCols, { ellipsis: "" })];
+  }
+
+  const trimmed = trimTrailingSpacesAnsi(clean);
+  const result: string[] = [];
+
+  let activeSgr = "";
+  let currentLine = "";
+  let currentWidth = 0;
+
+  const flushLine = () => {
+    result.push(currentLine + (activeSgr ? RESET : ""));
+    currentLine = activeSgr;
+    currentWidth = 0;
+  };
+
+  TOKEN_REGEX.lastIndex = 0;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  const pushPlain = (segment: string) => {
+    for (const ch of segment) {
+      const cp = ch.codePointAt(0) ?? 0;
+      const w = codePointWidth(cp);
+      if (w > 0 && currentWidth + w > maxCols && currentWidth > 0) {
+        flushLine();
+      }
+      currentLine += ch;
+      currentWidth += w;
+    }
+  };
+
+  while ((match = TOKEN_REGEX.exec(trimmed)) !== null) {
+    const plainChunk = trimmed.slice(lastIndex, match.index);
+    if (plainChunk) {
+      pushPlain(plainChunk);
+    }
+    const seq = match[0];
+    if (seq === "\x1b[0m" || seq === "\x1b[m") {
+      activeSgr = "";
+    } else if (seq.startsWith("\x1b[") && seq.endsWith("m")) {
+      activeSgr += seq;
+    }
+    currentLine += seq;
+    lastIndex = TOKEN_REGEX.lastIndex;
+  }
+
+  if (lastIndex < trimmed.length) {
+    pushPlain(trimmed.slice(lastIndex));
+  }
+
+  if (currentWidth > 0 || result.length === 0) {
+    result.push(currentLine + (activeSgr ? RESET : ""));
+  }
+
+  return result;
+}
+
+function trimTrailingSpacesAnsi(input: string): string {
+  // Strip trailing plain spaces (preserving trailing SGR resets cleanly)
+  const parts: Array<{ isAnsi: boolean; text: string }> = [];
+  TOKEN_REGEX.lastIndex = 0;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = TOKEN_REGEX.exec(input)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ isAnsi: false, text: input.slice(lastIndex, match.index) });
+    }
+    parts.push({ isAnsi: true, text: match[0] });
+    lastIndex = TOKEN_REGEX.lastIndex;
+  }
+  if (lastIndex < input.length) {
+    parts.push({ isAnsi: false, text: input.slice(lastIndex) });
+  }
+
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]!;
+    if (p.isAnsi) continue;
+    const trimmed = p.text.replace(/[ \t]+$/, "");
+    p.text = trimmed;
+    if (trimmed.length > 0) break;
+  }
+
+  return parts.map((p) => p.text).join("");
+}

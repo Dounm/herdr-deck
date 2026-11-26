@@ -134,10 +134,10 @@ export async function runTuiApp(): Promise<void> {
   const fetchPreviewForPane = async (targetPaneId: string, seq: number) => {
     try {
       const readRes = await client.readPane(targetPaneId, {
-        source: "recent",
+        source: "recent_unwrapped",
         format: "ansi",
         stripAnsi: false,
-        lines: 100,
+        lines: 80,
       });
       if (exiting) return;
 
