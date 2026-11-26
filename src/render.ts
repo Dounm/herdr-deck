@@ -16,7 +16,7 @@ import {
 import { formatDurationCompact, formatRelativeAge } from "./state.ts";
 import type { AttentionGroup, DeckAgentItem } from "./types.ts";
 
-export type UiFocusMode = "list" | "reply";
+export type UiFocusMode = "list" | "reply" | "rename";
 export type FilterTab = "all" | "attention" | "working";
 
 export interface RenderState {
@@ -31,6 +31,8 @@ export interface RenderState {
   previewText: string;
   replyDraft: string;
   replyCursor: number;
+  renameDraft: string;
+  renameCursor: number;
   toastMessage: string | null;
   toastKind: "info" | "ok" | "warn" | "error";
   spinnerTick: number;
@@ -546,44 +548,55 @@ function renderInlineReplyCard(
   startRow1Based: number,
 ): { lines: string[]; cursor: { row: number; col: number } | null } {
   const isReply = state.focusMode === "reply";
+  const isRename = state.focusMode === "rename";
+  const isEditing = isReply || isRename;
   const isBlocked = selected?.group === "needs_you";
 
-  const borderColor = isReply
-    ? GRUVBOX.yellow
-    : isBlocked
-      ? GRUVBOX.orange
-      : GRUVBOX.darkGray;
+  const borderColor = isRename
+    ? GRUVBOX.aqua
+    : isReply
+      ? GRUVBOX.yellow
+      : isBlocked
+        ? GRUVBOX.orange
+        : GRUVBOX.darkGray;
 
   const targetName = selected ? selected.primaryTitle : "Agent";
-  const title = isReply
-    ? `${GRUVBOX.yellow}${BOLD}回复 → ${targetName}${RESET}`
-    : isBlocked
-      ? `${GRUVBOX.orange}${BOLD}快速审批 / 回复${RESET}`
-      : `${GRUVBOX.fg3}快速回复${RESET}`;
+  const title = isRename
+    ? `${GRUVBOX.aqua}${BOLD}重命名 Pane → ${targetName}${RESET}`
+    : isReply
+      ? `${GRUVBOX.yellow}${BOLD}回复 → ${targetName}${RESET}`
+      : isBlocked
+        ? `${GRUVBOX.orange}${BOLD}快速审批 / 回复${RESET}`
+        : `${GRUVBOX.fg3}快速回复${RESET}`;
 
-  const rightTag = isReply
-    ? `${GRUVBOX.gray}Enter 发送 · Esc 取消${RESET}`
-    : isBlocked
-      ? `${GRUVBOX.gray}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
-      : `${GRUVBOX.gray}[r] 输入 · [Enter] 进终端${RESET}`;
+  const rightTag = isRename
+    ? `${GRUVBOX.gray}Enter 保存 · 留空清除 · Esc 取消${RESET}`
+    : isReply
+      ? `${GRUVBOX.gray}Enter 发送 · Esc 取消${RESET}`
+      : isBlocked
+        ? `${GRUVBOX.gray}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
+        : `${GRUVBOX.gray}[r] 输入 · [R] 重命名 · [Enter] 进终端${RESET}`;
 
   let content = "";
   let rowBg: string | undefined;
   let cursor: { row: number; col: number } | null = null;
 
-  if (isReply) {
+  if (isEditing) {
     rowBg = GRUVBOX.bg1;
     // Inner width excludes left/right │ borders (2 cols) and leading " ❯ " prompt (3 cols)
     const innerWidth = Math.max(4, width - 2);
     const promptPrefixWidth = 3;
     const inputCols = Math.max(2, innerWidth - promptPrefixWidth);
+    const activeDraft = isRename ? state.renameDraft : state.replyDraft;
+    const activeCursor = isRename ? state.renameCursor : state.replyCursor;
+    const promptColor = isRename ? GRUVBOX.aqua : GRUVBOX.yellow;
     const { visibleText, cursorCellOffset } = layoutEditableInput(
-      state.replyDraft,
-      state.replyCursor,
+      activeDraft,
+      activeCursor,
       inputCols,
     );
-    content = `${GRUVBOX.bg1}${GRUVBOX.yellow}${BOLD} ❯ ${RESET}${GRUVBOX.bg1}${GRUVBOX.fg0}${visibleText}${RESET}`;
-    // 1-based cursor coordinates inside the reply input row
+    content = `${GRUVBOX.bg1}${promptColor}${BOLD} ❯ ${RESET}${GRUVBOX.bg1}${GRUVBOX.fg0}${visibleText}${RESET}`;
+    // 1-based cursor coordinates inside the inline input row (enables macOS CJK IME preedit)
     cursor = {
       row: startRow1Based + 1,
       col: startCol1Based + 1 + promptPrefixWidth + cursorCellOffset,
@@ -642,6 +655,7 @@ function renderCheatsheetBody(cols: number, height: number): string[] {
     {
       heading: "队列管理",
       rows: [
+        ["R (Shift+r)", "原地重命名选中 Pane（留空回车清除名称）"],
         ["m / Space", "将「待审阅」项标记为已阅并移向下一待办"],
         ["f", "循环切换过滤视图（全部 / 仅待办 / 活跃）"],
         ["z", "展开或隐藏 IDLE 空闲分组"],
@@ -723,6 +737,12 @@ function renderFooterBar(state: RenderState, cols: number): string {
   if (state.showHelp) {
     hints = [
       ["? / Esc", "返回面板"],
+    ];
+  } else if (state.focusMode === "rename") {
+    hints = [
+      ["Enter", "保存名称"],
+      ["Ctrl+U", "清空(清除名称)"],
+      ["Esc", "取消"],
     ];
   } else if (state.focusMode === "reply") {
     hints = [

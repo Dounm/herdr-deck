@@ -65,6 +65,9 @@ export async function runTuiApp(): Promise<void> {
   let previewText = "";
   let replyDraft = "";
   let replyCursor = 0;
+  let renameDraft = "";
+  let renameCursor = 0;
+  let renameTargetPaneId: string | null = null;
   let toastMessage: string | null = null;
   let toastKind: "info" | "ok" | "warn" | "error" = "info";
   let toastTimer: NodeJS.Timeout | null = null;
@@ -103,6 +106,8 @@ export async function runTuiApp(): Promise<void> {
     previewText,
     replyDraft,
     replyCursor,
+    renameDraft,
+    renameCursor,
     toastMessage,
     toastKind,
     spinnerTick,
@@ -483,6 +488,41 @@ export async function runTuiApp(): Promise<void> {
     }
   };
 
+  const submitPaneRename = async () => {
+    const targetPaneId = renameTargetPaneId ?? getSelectedItem()?.paneId ?? null;
+    const nextLabel = renameDraft.trim() || null;
+    focusMode = "list";
+    renameTargetPaneId = null;
+
+    if (!targetPaneId) {
+      scheduleRender();
+      return;
+    }
+
+    try {
+      await client.renamePane(targetPaneId, nextLabel);
+      // Optimistically update local snapshot so card title and color refresh immediately
+      if (snapshot) {
+        const targetPane = snapshot.panes.find((p) => p.pane_id === targetPaneId);
+        if (targetPane) {
+          targetPane.label = nextLabel;
+        }
+        items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
+      }
+      setToast(
+        nextLabel ? `已重命名为「${nextLabel}」` : "已清除自定义 Pane 名称",
+        "ok",
+        2200,
+      );
+      void refreshSnapshot(true);
+    } catch (err) {
+      setToast(
+        `重命名失败: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    }
+  };
+
   const markSelectedReviewed = () => {
     const sel = getSelectedItem();
     if (!sel) return;
@@ -594,6 +634,17 @@ export async function runTuiApp(): Promise<void> {
             scheduleRender();
           }
           return;
+        case "R": {
+          const sel = getSelectedItem();
+          if (sel) {
+            focusMode = "rename";
+            renameTargetPaneId = sel.paneId;
+            renameDraft = sel.paneLabel ?? "";
+            renameCursor = Array.from(renameDraft).length;
+            scheduleRender();
+          }
+          return;
+        }
         case "m":
           markSelectedReviewed();
           return;
@@ -654,105 +705,112 @@ export async function runTuiApp(): Promise<void> {
     }
   };
 
-  const handleReplyModeKey = async (key: ParsedKey) => {
-    const chars = Array.from(replyDraft);
-    const pos = Math.max(0, Math.min(chars.length, replyCursor));
+  const applyLineEditKey = (
+    draft: string,
+    cursor: number,
+    key: ParsedKey,
+  ): { draft: string; cursor: number; changed: boolean } => {
+    const chars = Array.from(draft);
+    const pos = Math.max(0, Math.min(chars.length, cursor));
 
     if (key.kind === "special") {
-      if (key.name === "esc") {
-        focusMode = "list";
-        scheduleRender();
-        return;
+      switch (key.name) {
+        case "left":
+          return { draft, cursor: Math.max(0, pos - 1), changed: true };
+        case "right":
+          return { draft, cursor: Math.min(chars.length, pos + 1), changed: true };
+        case "home":
+          return { draft, cursor: 0, changed: true };
+        case "end":
+          return { draft, cursor: chars.length, changed: true };
+        case "backspace":
+          if (pos > 0) {
+            chars.splice(pos - 1, 1);
+            return { draft: chars.join(""), cursor: pos - 1, changed: true };
+          }
+          return { draft, cursor: pos, changed: false };
+        case "delete":
+          if (pos < chars.length) {
+            chars.splice(pos, 1);
+            return { draft: chars.join(""), cursor: pos, changed: true };
+          }
+          return { draft, cursor: pos, changed: false };
+        case "space":
+          chars.splice(pos, 0, " ");
+          return { draft: chars.join(""), cursor: pos + 1, changed: true };
+        default:
+          return { draft, cursor: pos, changed: false };
       }
-      if (key.name === "enter") {
-        await submitInlineReply();
-        return;
-      }
-      if (key.name === "left") {
-        replyCursor = Math.max(0, pos - 1);
-        scheduleRender();
-        return;
-      }
-      if (key.name === "right") {
-        replyCursor = Math.min(chars.length, pos + 1);
-        scheduleRender();
-        return;
-      }
-      if (key.name === "home") {
-        replyCursor = 0;
-        scheduleRender();
-        return;
-      }
-      if (key.name === "end") {
-        replyCursor = chars.length;
-        scheduleRender();
-        return;
-      }
-      if (key.name === "backspace") {
-        if (pos > 0) {
-          chars.splice(pos - 1, 1);
-          replyDraft = chars.join("");
-          replyCursor = pos - 1;
-          scheduleRender();
-        }
-        return;
-      }
-      if (key.name === "delete") {
-        if (pos < chars.length) {
-          chars.splice(pos, 1);
-          replyDraft = chars.join("");
-          scheduleRender();
-        }
-        return;
-      }
-      if (key.name === "space") {
-        chars.splice(pos, 0, " ");
-        replyDraft = chars.join("");
-        replyCursor = pos + 1;
-        scheduleRender();
-        return;
-      }
-      return;
     }
 
     if (key.kind === "ctrl") {
-      if (key.key === "c") {
-        focusMode = "list";
-        scheduleRender();
-        return;
-      }
-      if (key.key === "a") {
-        replyCursor = 0;
-        scheduleRender();
-        return;
-      }
-      if (key.key === "e") {
-        replyCursor = chars.length;
-        scheduleRender();
-        return;
-      }
+      if (key.key === "a") return { draft, cursor: 0, changed: true };
+      if (key.key === "e") return { draft, cursor: chars.length, changed: true };
       if (key.key === "u") {
-        replyDraft = chars.slice(pos).join("");
-        replyCursor = 0;
-        scheduleRender();
-        return;
+        return { draft: chars.slice(pos).join(""), cursor: 0, changed: true };
       }
       if (key.key === "w") {
         const before = chars.slice(0, pos).join("");
         const after = chars.slice(pos).join("");
         const trimmedBefore = before.replace(/\S+\s*$/, "");
-        replyDraft = trimmedBefore + after;
-        replyCursor = Array.from(trimmedBefore).length;
-        scheduleRender();
-        return;
+        return {
+          draft: trimmedBefore + after,
+          cursor: Array.from(trimmedBefore).length,
+          changed: true,
+        };
       }
-      return;
+      return { draft, cursor: pos, changed: false };
     }
 
     if (key.kind === "char") {
       chars.splice(pos, 0, key.value);
-      replyDraft = chars.join("");
-      replyCursor = pos + 1;
+      return { draft: chars.join(""), cursor: pos + 1, changed: true };
+    }
+
+    return { draft, cursor: pos, changed: false };
+  };
+
+  const handleReplyModeKey = async (key: ParsedKey) => {
+    if (
+      (key.kind === "special" && key.name === "esc") ||
+      (key.kind === "ctrl" && key.key === "c")
+    ) {
+      focusMode = "list";
+      scheduleRender();
+      return;
+    }
+    if (key.kind === "special" && key.name === "enter") {
+      await submitInlineReply();
+      return;
+    }
+
+    const next = applyLineEditKey(replyDraft, replyCursor, key);
+    if (next.changed) {
+      replyDraft = next.draft;
+      replyCursor = next.cursor;
+      scheduleRender();
+    }
+  };
+
+  const handleRenameModeKey = async (key: ParsedKey) => {
+    if (
+      (key.kind === "special" && key.name === "esc") ||
+      (key.kind === "ctrl" && key.key === "c")
+    ) {
+      focusMode = "list";
+      renameTargetPaneId = null;
+      scheduleRender();
+      return;
+    }
+    if (key.kind === "special" && key.name === "enter") {
+      await submitPaneRename();
+      return;
+    }
+
+    const next = applyLineEditKey(renameDraft, renameCursor, key);
+    if (next.changed) {
+      renameDraft = next.draft;
+      renameCursor = next.cursor;
       scheduleRender();
     }
   };
@@ -773,6 +831,8 @@ export async function runTuiApp(): Promise<void> {
           if (exiting) break;
           if (focusMode === "reply") {
             await handleReplyModeKey(k);
+          } else if (focusMode === "rename") {
+            await handleRenameModeKey(k);
           } else {
             await handleListModeKey(k);
           }

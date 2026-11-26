@@ -159,6 +159,10 @@ export class HerdrSocketClient {
     await this.request("agent.prompt", { target, text });
   }
 
+  async renamePane(paneId: string, label: string | null): Promise<void> {
+    await this.request("pane.rename", { pane_id: paneId, label });
+  }
+
   async focusAgent(target: string): Promise<void> {
     await this.request("agent.focus", { target });
   }

@@ -223,6 +223,8 @@ test("3-card layout & cheatsheet overlay render with exact column width and DEC 
     previewText: "\x1b[33m╭─ Permission ─╮\x1b[0m\n│ Allow Bash?  │\n╰──────────────╯",
     replyDraft: "",
     replyCursor: 0,
+    renameDraft: "",
+    renameCursor: 0,
     toastMessage: null,
     toastKind: "info" as const,
     spinnerTick: 2,
@@ -271,6 +273,21 @@ test("3-card layout & cheatsheet overlay render with exact column width and DEC 
   // Row 24 (1-based: top bar 1 + bodyRows 24 -> reply middle row is 1 + 24 - 1 = 24)
   // Left width = floor(112 * 0.36) = 40; right starts at col 41; border + " ❯ " = +4 -> col 45; "你好a" = 5 cells -> col 50
   assert.ok(replyFrame.includes("\x1b[24;50H\x1b[6 q\x1b[?25h"), "expected hardware cursor positioned inside reply box");
+
+  // Rename mode reuses inline input box with aqua theme & real hardware cursor
+  const renameFrame = renderScreen({
+    ...baseState,
+    focusMode: "rename",
+    renameDraft: "auth",
+    renameCursor: 4,
+  });
+  const renameLines = extractRows(renameFrame);
+  assert.equal(renameLines.length, rows);
+  for (const [idx, line] of renameLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `rename row ${idx} width mismatch: "${line}"`);
+  }
+  assert.ok(renameLines.join("\n").includes("重命名 Pane → herdr plugin"));
+  assert.ok(renameFrame.includes("\x1b[24;49H\x1b[6 q\x1b[?25h"), "expected hardware cursor positioned inside rename box");
 });
 
 test("key parser handles arrows, CJK UTF-8 characters, and Herdr key specs", () => {

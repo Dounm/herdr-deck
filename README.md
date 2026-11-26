@@ -58,6 +58,7 @@ herdr server reload-config
 | `j` / `k` 或 `↑` / `↓` | 上下切换 Agent，右侧实时预览最新画面 |
 | `Enter` | 进入选中 Agent 的真实终端并关闭面板 |
 | `r` 或 `/` | 聚焦右下角输入框，一句话发给选中 Agent（`Enter` 发送，`Esc` 取消，支持中文输入法） |
+| `R`（`Shift+r`） | 原地重命名选中 Pane（自动预填当前名称，留空回车清除自定义名） |
 | `y` / `n` / `a` / `1-4` | 选中 `NEEDS YOU` 项时原地发送快捷审批键 |
 | `m` 或 `Space` | 标记 `READY FOR REVIEW` 项为已阅并移向下一待办 |
 | `?` | 打开 / 关闭完整快捷键速查表（Cheatsheet） |
