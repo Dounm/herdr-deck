@@ -1,0 +1,22 @@
+{
+  "name": "herdr-deck",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Mission Control Deck & Quick Agent Inbox plugin for Herdr",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "verify": "pnpm check && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.3"
+  }
+}

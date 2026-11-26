@@ -1,0 +1,41 @@
+id = "karllooki.herdr-deck"
+name = "Herdr Deck"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Attention-driven Agent Inbox & Control Deck popup for Herdr"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["pnpm", "install", "--frozen-lockfile"]
+
+[[build]]
+command = ["pnpm", "run", "build"]
+
+[[startup]]
+command = ["node", "dist/cli.mjs", "startup"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "dist/cli.mjs", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["node", "dist/cli.mjs", "event"]
+
+[[events]]
+on = "pane.closed"
+command = ["node", "dist/cli.mjs", "event"]
+
+[[panes]]
+id = "inbox"
+title = "Herdr Deck"
+placement = "popup"
+width = "92%"
+height = "88%"
+command = ["node", "dist/cli.mjs", "ui"]
+
+[[actions]]
+id = "inbox"
+title = "Open Herdr Deck (Agent Inbox)"
+contexts = ["workspace"]
+command = ["node", "dist/cli.mjs", "action", "inbox"]
