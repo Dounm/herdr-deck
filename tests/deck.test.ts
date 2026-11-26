@@ -15,16 +15,19 @@ import { parseGitPorcelainV2, refreshGitInfoForCwds, type GitCacheEntry } from "
 import { parseTerminalInput, toHerdrKeySpec } from "../src/keys.ts";
 import {
   buildDeckAgentItems,
+  buildMultiMachineDeckItems,
   collectSnapshotGitCwds,
   resolvePrimaryTitle,
   stripAnsi,
   summarizeScreenLines,
 } from "../src/model.ts";
+import { parseMachineListJson, parseSnapshotCliJson } from "../src/remote-client.ts";
 import { renderScreen } from "../src/render.ts";
 import {
   createEmptyState,
   formatDurationCompact,
   loadDeckState,
+  makeAgentTimerKey,
   markAgentSeenInDeck,
   reconcileTimersWithSnapshot,
   recordAgentStatusTransition,
@@ -194,6 +197,9 @@ test("3-card layout & cheatsheet overlay render with exact column width and DEC 
     rows,
     items: [
       {
+        itemKey: "w1:p1",
+        machineId: null,
+        machineLabel: null,
         paneId: "w1:p1",
         workspaceId: "w1",
         tabId: "w1:t1",
@@ -217,7 +223,7 @@ test("3-card layout & cheatsheet overlay render with exact column width and DEC 
         focusedInHerdr: true,
       },
     ],
-    selectedPaneId: "w1:p1",
+    selectedItemKey: "w1:p1",
     focusMode: "list" as const,
     filterTab: "all" as const,
     showIdle: true,
@@ -437,7 +443,7 @@ test("git porcelain v2 parser, TTL cache, and UI rendering replace paneId with g
     cols,
     rows,
     items,
-    selectedPaneId: "w1:p1",
+    selectedItemKey: "w1:p1",
     focusMode: "list",
     filterTab: "all",
     showIdle: true,
@@ -465,4 +471,140 @@ test("git porcelain v2 parser, TTL cache, and UI rendering replace paneId with g
   assert.ok(!plainAll.includes("w2:p1"), "expected w2:p1 to be removed from UI");
   assert.ok(plainAll.includes("⎇ feat/git-status *3 ↑2 ↓1"), "expected full git status in preview header");
   assert.ok(plainAll.includes("*3 ↑2 ↓1"), "expected git dirty/ahead/behind counters in IDLE row");
+});
+
+test("multi-machine aggregation isolates colliding paneIds, timers, and renders @machine badges", () => {
+  const machines = parseMachineListJson(
+    JSON.stringify([
+      { id: "m-tokyo", label: "soltokyo", target: "soltokyo-box", session: "default", enabled: true, selected: false },
+      { id: "m-disabled", label: "old-box", target: "old", session: "default", enabled: false, selected: false },
+    ]),
+  );
+  assert.equal(machines.length, 2);
+  assert.equal(machines[0]!.label, "soltokyo");
+  assert.equal(machines[1]!.enabled, false);
+
+  const remoteSnap = parseSnapshotCliJson(
+    JSON.stringify({
+      id: "req_1",
+      result: {
+        snapshot: {
+          version: "0.9.5",
+          protocol: 22,
+          workspaces: [
+            {
+              workspace_id: "w1",
+              number: 1,
+              label: "repo",
+              focused: true,
+              pane_count: 1,
+              tab_count: 1,
+              active_tab_id: "w1:t1",
+              agent_status: "working",
+            },
+          ],
+          tabs: [
+            { tab_id: "w1:t1", workspace_id: "w1", number: 1, label: "1", focused: true, pane_count: 1, agent_status: "working" },
+          ],
+          panes: [
+            { pane_id: "w1:p1", terminal_id: "rt1", workspace_id: "w1", tab_id: "w1:t1", focused: true, revision: 3, cwd: "/home/dev/sol-execbench", agent_status: "working" },
+          ],
+          agents: [
+            { pane_id: "w1:p1", terminal_id: "rt1", workspace_id: "w1", tab_id: "w1:t1", focused: true, revision: 3, cwd: "/home/dev/sol-execbench", agent: "agy", agent_status: "working" },
+          ],
+        },
+      },
+    }),
+  );
+
+  const localSnap: SessionSnapshot = {
+    version: "0.9.5",
+    protocol: 22,
+    workspaces: [
+      {
+        workspace_id: "w1",
+        number: 1,
+        label: "local-ws",
+        focused: true,
+        pane_count: 1,
+        tab_count: 1,
+        active_tab_id: "w1:t1",
+        agent_status: "idle",
+      },
+    ],
+    tabs: [
+      { tab_id: "w1:t1", workspace_id: "w1", number: 1, label: "main", focused: true, pane_count: 1, agent_status: "idle" },
+    ],
+    panes: [
+      { pane_id: "w1:p1", terminal_id: "lt1", workspace_id: "w1", tab_id: "w1:t1", focused: true, revision: 1, cwd: "/Users/me/local-ws", agent_status: "idle" },
+    ],
+    agents: [
+      { pane_id: "w1:p1", terminal_id: "lt1", workspace_id: "w1", tab_id: "w1:t1", focused: true, revision: 1, cwd: "/Users/me/local-ws", agent: "claude", agent_status: "idle" },
+    ],
+  };
+
+  const state = createEmptyState();
+  const now = 100_000;
+  reconcileTimersWithSnapshot(state, localSnap, now - 60_000, null);
+  reconcileTimersWithSnapshot(state, remoteSnap, now - 15_000, "m-tokyo");
+  // Reconciling local again must NOT prune remote machine timers
+  reconcileTimersWithSnapshot(state, localSnap, now, null);
+  assert.ok(state.timers["w1:p1"]);
+  assert.ok(state.timers[makeAgentTimerKey("w1:p1", "m-tokyo")]);
+
+  const snippets = new Map<string, string>([
+    [makeAgentTimerKey("w1:p1", "m-tokyo"), "Running remote benchmark suite..."],
+  ]);
+  const items = buildMultiMachineDeckItems(
+    [
+      { snapshot: localSnap },
+      { machineId: "m-tokyo", machineLabel: "soltokyo", snapshot: remoteSnap },
+    ],
+    state,
+    snippets,
+    now,
+  );
+
+  assert.equal(items.length, 2);
+  // Remote working agent sorts ahead of local idle agent, and itemKeys do not collide even though both paneIds are w1:p1
+  assert.equal(items[0]!.itemKey, "m-tokyo::w1:p1");
+  assert.equal(items[0]!.machineLabel, "soltokyo");
+  assert.equal(items[0]!.focusedInHerdr, false);
+  assert.equal(items[0]!.summary, "Running remote benchmark suite...");
+  assert.equal(items[1]!.itemKey, "w1:p1");
+  assert.equal(items[1]!.machineId, null);
+
+  const cols = 112;
+  const rows = 20;
+  const frame = renderScreen({
+    cols,
+    rows,
+    items,
+    selectedItemKey: "m-tokyo::w1:p1",
+    focusMode: "list",
+    filterTab: "all",
+    showIdle: true,
+    showHelp: false,
+    previewText: "Benchmark step 3/10",
+    replyDraft: "",
+    replyCursor: 0,
+    renameDraft: "",
+    renameCursor: 0,
+    toastMessage: null,
+    toastKind: "info",
+    spinnerTick: 1,
+    nowMs: now,
+  });
+
+  const plainLines = [...frame.matchAll(/\x1b\[(\d+);1H([\s\S]*?)\x1b\[K/g)].map((m) =>
+    stripAnsi(m[2]!),
+  );
+  assert.equal(plainLines.length, rows);
+  for (const [idx, line] of plainLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `remote row ${idx} width mismatch: "${line}"`);
+  }
+  const plainAll = plainLines.join("\n");
+  assert.ok(plainAll.includes("@soltokyo"), "expected @soltokyo badge in list and preview header");
+  assert.ok(plainAll.includes("远端仅原地操作"), "expected remote-only hint in reply box");
+  assert.ok(!plainAll.includes("[Enter] 进终端"), "expected Enter jump hint to be hidden for remote items");
 });

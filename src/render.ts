@@ -23,7 +23,7 @@ export interface RenderState {
   cols: number;
   rows: number;
   items: DeckAgentItem[];
-  selectedPaneId: string | null;
+  selectedItemKey: string | null;
   focusMode: UiFocusMode;
   filterTab: FilterTab;
   showIdle: boolean;
@@ -73,7 +73,7 @@ export function renderScreen(state: RenderState): string {
 
   const visibleItems = getVisibleItems(state);
   const selectedItem =
-    visibleItems.find((x) => x.paneId === state.selectedPaneId) ??
+    visibleItems.find((x) => x.itemKey === state.selectedItemKey) ??
     visibleItems[0] ??
     null;
 
@@ -96,7 +96,7 @@ export function renderScreen(state: RenderState): string {
       const leftLines = renderAgentListCard(
         state,
         visibleItems,
-        selectedItem?.paneId ?? null,
+        selectedItem?.itemKey ?? null,
         cols,
         topRows,
       );
@@ -109,7 +109,7 @@ export function renderScreen(state: RenderState): string {
       const leftLines = renderAgentListCard(
         state,
         visibleItems,
-        selectedItem?.paneId ?? null,
+        selectedItem?.itemKey ?? null,
         leftWidth,
         bodyRows,
       );
@@ -205,7 +205,7 @@ function renderTopBar(state: RenderState, cols: number): string {
 function renderAgentListCard(
   state: RenderState,
   visibleItems: DeckAgentItem[],
-  selectedPaneId: string | null,
+  selectedItemKey: string | null,
   width: number,
   height: number,
 ): string[] {
@@ -220,7 +220,7 @@ function renderAgentListCard(
   const innerLines = renderAgentListInner(
     state,
     visibleItems,
-    selectedPaneId,
+    selectedItemKey,
     innerWidth,
     innerHeight,
   );
@@ -236,7 +236,7 @@ function renderAgentListCard(
 function renderAgentListInner(
   state: RenderState,
   visibleItems: DeckAgentItem[],
-  selectedPaneId: string | null,
+  selectedItemKey: string | null,
   width: number,
   height: number,
 ): string[] {
@@ -267,7 +267,7 @@ function renderAgentListInner(
 
   interface LogicalRow {
     text: string;
-    paneId?: string;
+    itemKey?: string;
   }
 
   const rows: LogicalRow[] = [];
@@ -293,17 +293,17 @@ function renderAgentListInner(
     });
 
     for (const item of groupItems) {
-      const isSelected = item.paneId === selectedPaneId;
+      const isSelected = item.itemKey === selectedItemKey;
       const [line1, line2] = renderAgentCardRows(state, item, isSelected, width);
-      rows.push({ text: line1, paneId: item.paneId });
-      rows.push({ text: line2, paneId: item.paneId });
+      rows.push({ text: line1, itemKey: item.itemKey });
+      rows.push({ text: line2, itemKey: item.itemKey });
     }
   }
 
   let selFirstRow = 0;
   let selLastRow = 0;
   for (let i = 0; i < rows.length; i++) {
-    if (rows[i]!.paneId === selectedPaneId) {
+    if (rows[i]!.itemKey === selectedItemKey) {
       selFirstRow = i;
       selLastRow = i + 1;
       break;
@@ -454,20 +454,28 @@ function renderAgentCardRows(
     });
   }
 
-  // Line 2: compact meta (`workspace · agent`) + cleaned summary
+  // Line 2: compact meta (`@machine·agent` or `workspace·agent`) + cleaned summary
   const subPrefix = isSelected
     ? `${rowBg}${GRUVBOX.orange}${BOLD}▌${RESET}${rowBg}  `
     : "   ";
   const showWorkspaceInMeta =
     item.primaryTitle.toLowerCase() !== item.workspaceLabel.toLowerCase();
-  const metaTag = showWorkspaceInMeta
-    ? `${item.workspaceLabel}·${item.agentDisplayName}`
-    : item.agentDisplayName;
   const metaColor = isSelected ? GRUVBOX.fg3 : GRUVBOX.darkGray;
   const summaryColor = isSelected ? GRUVBOX.fg2 : GRUVBOX.gray;
 
+  let metaRendered: string;
+  if (item.machineLabel) {
+    const machinePrefix = `${rowBg}${GRUVBOX.purple}@${item.machineLabel}${RESET}`;
+    metaRendered = `${machinePrefix}${rowBg}${metaColor}·${item.agentDisplayName}${RESET}`;
+  } else {
+    const metaTag = showWorkspaceInMeta
+      ? `${item.workspaceLabel}·${item.agentDisplayName}`
+      : item.agentDisplayName;
+    metaRendered = `${rowBg}${metaColor}${metaTag}${RESET}`;
+  }
+
   const line2Raw =
-    `${subPrefix}${metaColor}${metaTag}${RESET}` +
+    `${subPrefix}${metaRendered}` +
     `${rowBg}${GRUVBOX.darkGray} │ ${RESET}` +
     `${rowBg}${summaryColor}${item.summary}${RESET}`;
 
@@ -524,9 +532,14 @@ function renderPreviewCard(
   if (selected) {
     const titleColor = pickNameColor(selected.primaryTitle);
     const gitBadge = renderGitBadge(selected.gitInfo, selected.branch, { includeBranch: true });
-    const cwdPart = selected.cwd ? ` ${GRUVBOX.gray}${shortenHome(selected.cwd)}${RESET}` : "";
+    const cwdPart = selected.cwd
+      ? ` ${GRUVBOX.gray}${selected.machineId ? selected.cwd : shortenHome(selected.cwd)}${RESET}`
+      : "";
+    const machinePart = selected.machineLabel
+      ? `${GRUVBOX.purple}${BOLD}@${selected.machineLabel}${RESET}${GRUVBOX.gray} · `
+      : "";
     const baseTitle =
-      `${titleColor}${BOLD}${selected.primaryTitle}${RESET}` +
+      `${machinePart}${titleColor}${BOLD}${selected.primaryTitle}${RESET}` +
       `${GRUVBOX.gray} · ${GRUVBOX.fg3}${selected.workspaceLabel} › ${selected.tabLabel} › ${GRUVBOX.yellow}${selected.agentDisplayName}${RESET}`;
 
     if (isBlocked) {
@@ -637,13 +650,18 @@ function renderInlineReplyCard(
         ? `${GRUVBOX.orange}${BOLD}快速审批 / 回复${RESET}`
         : `${GRUVBOX.fg3}快速回复${RESET}`;
 
+  const isRemote = Boolean(selected?.machineId);
   const rightTag = isRename
     ? `${GRUVBOX.gray}Enter 保存 · 留空清除 · Esc 取消${RESET}`
     : isReply
       ? `${GRUVBOX.gray}Enter 发送 · Esc 取消${RESET}`
       : isBlocked
-        ? `${GRUVBOX.gray}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
-        : `${GRUVBOX.gray}[r] 输入 · [R] 重命名 · [Enter] 进终端${RESET}`;
+        ? isRemote
+          ? `${GRUVBOX.gray}[y/n/1-4] 审批 · [r] 回复${RESET}`
+          : `${GRUVBOX.gray}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
+        : isRemote
+          ? `${GRUVBOX.gray}[r] 输入 · [R] 重命名 · 远端仅原地操作${RESET}`
+          : `${GRUVBOX.gray}[r] 输入 · [R] 重命名 · [Enter] 进终端${RESET}`;
 
   let content = "";
   let rowBg: string | undefined;
@@ -683,9 +701,13 @@ function renderInlineReplyCard(
     content = `${GRUVBOX.gray} 暂无可操作 Agent${RESET}`;
   } else if (isBlocked) {
     rowBg = GRUVBOX.bgUrgent;
-    content = `${GRUVBOX.bgUrgent}${GRUVBOX.orange}${BOLD} ❯ ${RESET}${GRUVBOX.bgUrgent}${GRUVBOX.fg1}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项 · 或 [Enter] 进入终端处理${RESET}`;
+    content = isRemote
+      ? `${GRUVBOX.bgUrgent}${GRUVBOX.orange}${BOLD} ❯ ${RESET}${GRUVBOX.bgUrgent}${GRUVBOX.fg1}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项（远端机器不支持 Enter 跳转）${RESET}`
+      : `${GRUVBOX.bgUrgent}${GRUVBOX.orange}${BOLD} ❯ ${RESET}${GRUVBOX.bgUrgent}${GRUVBOX.fg1}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项 · 或 [Enter] 进入终端处理${RESET}`;
   } else {
-    content = `${GRUVBOX.gray} ❯ 按 ${GRUVBOX.fg2}[r]${GRUVBOX.gray} 一句话派活给 ${pickNameColor(targetName)}${targetName}${GRUVBOX.gray}，或 ${GRUVBOX.fg2}[Enter]${GRUVBOX.gray} 深入终端${RESET}`;
+    content = isRemote
+      ? `${GRUVBOX.gray} ❯ 按 ${GRUVBOX.fg2}[r]${GRUVBOX.gray} 一句话派活给 ${GRUVBOX.purple}@${selected.machineLabel}${GRUVBOX.gray} ${pickNameColor(targetName)}${targetName}${GRUVBOX.gray}（远端暂不支持 Enter 跳转）${RESET}`
+      : `${GRUVBOX.gray} ❯ 按 ${GRUVBOX.fg2}[r]${GRUVBOX.gray} 一句话派活给 ${pickNameColor(targetName)}${targetName}${GRUVBOX.gray}，或 ${GRUVBOX.fg2}[Enter]${GRUVBOX.gray} 深入终端${RESET}`;
   }
 
   const out: string[] = [renderBoxTop(title, rightTag, width, borderColor)];

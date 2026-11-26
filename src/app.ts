@@ -1,16 +1,29 @@
 import { refreshGitInfoForCwds, type GitCacheEntry } from "./git.ts";
 import { parseTerminalInput, type ParsedKey } from "./keys.ts";
-import { buildDeckAgentItems, collectSnapshotGitCwds } from "./model.ts";
+import {
+  buildMultiMachineDeckItems,
+  collectSnapshotGitCwds,
+  type MachineSnapshotSource,
+} from "./model.ts";
+import { HerdrCliError, HerdrMachineCliClient } from "./remote-client.ts";
 import { getVisibleItems, renderScreen, type FilterTab, type RenderState, type UiFocusMode } from "./render.ts";
 import { HerdrRpcError, HerdrSocketClient } from "./socket-client.ts";
 import {
   loadDeckState,
+  makeAgentTimerKey,
   markAgentSeenInDeck,
   reconcileTimersWithSnapshot,
   recordAgentStatusTransition,
   saveDeckState,
 } from "./state.ts";
-import type { AgentStatus, DeckAgentItem, GitRepoInfo, PersistedDeckState, SessionSnapshot } from "./types.ts";
+import type {
+  AgentStatus,
+  DeckAgentItem,
+  GitRepoInfo,
+  MachineProfile,
+  PersistedDeckState,
+  SessionSnapshot,
+} from "./types.ts";
 
 const GLOBAL_SUBSCRIPTIONS = [
   { type: "workspace.created" },
@@ -45,15 +58,27 @@ function readOriginFocusedPaneId(): string | null {
   return process.env.HERDR_PANE_ID ?? null;
 }
 
+const REMOTE_SNAPSHOT_INTERVAL_MS = 4500;
+const REMOTE_MACHINE_LIST_TTL_MS = 30000;
+const REMOTE_PREVIEW_POLL_INTERVAL_MS = 3600;
+
 export async function runTuiApp(): Promise<void> {
   const client = new HerdrSocketClient();
+  const remoteClient = new HerdrMachineCliClient();
   const selfPaneId = process.env.HERDR_PANE_ID ?? null;
   let originFocusedPaneId: string | null = readOriginFocusedPaneId();
 
   let persisted: PersistedDeckState = loadDeckState();
 
   let snapshot: SessionSnapshot | null = null;
-  const snippetsByPane = new Map<string, string>();
+  let remoteMachines: MachineProfile[] = [];
+  let lastMachineListFetchMs = 0;
+  let lastRemoteSnapshotFetchMs = 0;
+  let lastRemotePreviewPollMs = 0;
+  let remoteRefreshInFlight = false;
+  const remoteSnapshots = new Map<string, SessionSnapshot>();
+
+  const snippetsByKey = new Map<string, string>();
   const previewCache = new Map<string, string>();
   const lastFetchedRevision = new Map<string, number>();
   const gitCache = new Map<string, GitCacheEntry>();
@@ -61,7 +86,7 @@ export async function runTuiApp(): Promise<void> {
   let gitRefreshInFlight = false;
 
   let items: DeckAgentItem[] = [];
-  let selectedPaneId: string | null = null;
+  let selectedItemKey: string | null = null;
   let focusMode: UiFocusMode = "list";
   let filterTab: FilterTab = "all";
   let showIdle = true;
@@ -71,7 +96,7 @@ export async function runTuiApp(): Promise<void> {
   let replyCursor = 0;
   let renameDraft = "";
   let renameCursor = 0;
-  let renameTargetPaneId: string | null = null;
+  let renameTargetItem: { itemKey: string; paneId: string; machineId: string | null } | null = null;
   let toastMessage: string | null = null;
   let toastKind: "info" | "ok" | "warn" | "error" = "info";
   let toastTimer: NodeJS.Timeout | null = null;
@@ -102,7 +127,7 @@ export async function runTuiApp(): Promise<void> {
     cols: process.stdout.columns || 100,
     rows: process.stdout.rows || 30,
     items,
-    selectedPaneId,
+    selectedItemKey,
     focusMode,
     filterTab,
     showIdle,
@@ -122,7 +147,7 @@ export async function runTuiApp(): Promise<void> {
 
   const getSelectedItem = (): DeckAgentItem | null => {
     const vis = getCurrentVisible();
-    return vis.find((x) => x.paneId === selectedPaneId) ?? vis[0] ?? null;
+    return vis.find((x) => x.itemKey === selectedItemKey) ?? vis[0] ?? null;
   };
 
   const scheduleRender = (forceWrite = false) => {
@@ -141,8 +166,24 @@ export async function runTuiApp(): Promise<void> {
   };
 
   const rebuildItemsFromSnapshot = () => {
-    if (!snapshot) return;
-    items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId, Date.now(), gitInfoByCwd);
+    const sources: MachineSnapshotSource[] = [];
+    if (snapshot) {
+      sources.push({
+        snapshot,
+        excludePaneId: selfPaneId,
+        gitInfoByCwd,
+      });
+    }
+    for (const machine of remoteMachines) {
+      const rSnap = remoteSnapshots.get(machine.id);
+      if (!rSnap) continue;
+      sources.push({
+        machineId: machine.id,
+        machineLabel: machine.label,
+        snapshot: rSnap,
+      });
+    }
+    items = buildMultiMachineDeckItems(sources, persisted, snippetsByKey, Date.now());
   };
 
   const triggerGitRefresh = (force = false) => {
@@ -167,23 +208,30 @@ export async function runTuiApp(): Promise<void> {
       });
   };
 
-  const fetchPreviewForPane = async (targetPaneId: string, seq: number) => {
+  const fetchPreviewForItem = async (target: DeckAgentItem, seq: number) => {
     try {
-      const readRes = await client.readPane(targetPaneId, {
-        source: "recent_unwrapped",
-        format: "ansi",
-        stripAnsi: false,
-        lines: 80,
-      });
+      const readRes = target.machineId
+        ? await remoteClient.readPane(target.machineId, target.paneId, {
+            source: "recent_unwrapped",
+            format: "ansi",
+            lines: 80,
+            revision: target.revision,
+          })
+        : await client.readPane(target.paneId, {
+            source: "recent_unwrapped",
+            format: "ansi",
+            stripAnsi: false,
+            lines: 80,
+          });
       if (exiting) return;
 
-      previewCache.set(targetPaneId, readRes.text);
-      snippetsByPane.set(targetPaneId, readRes.text);
-      lastFetchedRevision.set(targetPaneId, readRes.revision);
+      previewCache.set(target.itemKey, readRes.text);
+      snippetsByKey.set(target.itemKey, readRes.text);
+      lastFetchedRevision.set(target.itemKey, readRes.revision || target.revision);
 
       // Strict generation & selection guard: never let a stale response overwrite a newer selection
       const currentSel = getSelectedItem();
-      if (seq !== previewRequestSeq || currentSel?.paneId !== targetPaneId) {
+      if (seq !== previewRequestSeq || currentSel?.itemKey !== target.itemKey) {
         return;
       }
 
@@ -195,7 +243,7 @@ export async function runTuiApp(): Promise<void> {
         scheduleRender();
       }
     } catch {
-      // Ignore transient read error if pane just closed
+      // Ignore transient read error if pane closed or remote machine disconnected
     }
   };
 
@@ -214,52 +262,126 @@ export async function runTuiApp(): Promise<void> {
     }
 
     const seq = ++previewRequestSeq;
-    const targetPaneId = sel.paneId;
+    const targetSnapshot = { ...sel };
 
     // Immediately show cached preview for this pane so rapid j/k navigation never flashes blank or old pane
-    const cached = previewCache.get(targetPaneId);
+    const cached = previewCache.get(targetSnapshot.itemKey);
     if (cached !== undefined) {
       previewText = cached;
+    } else {
+      previewText = "";
     }
 
     if (debounceMs <= 0) {
-      void fetchPreviewForPane(targetPaneId, seq);
+      void fetchPreviewForItem(targetSnapshot, seq);
       return;
     }
 
     previewDebounceTimer = setTimeout(() => {
       previewDebounceTimer = null;
       if (exiting || seq !== previewRequestSeq) return;
-      void fetchPreviewForPane(targetPaneId, seq);
+      void fetchPreviewForItem(targetSnapshot, seq);
     }, debounceMs);
   };
 
-  const refreshSnippetsForPriorityAgents = async (snap: SessionSnapshot) => {
+  const refreshSnippetsForPriorityAgents = async (
+    snap: SessionSnapshot,
+    machineId: string | null = null,
+  ) => {
     const candidates = snap.agents.filter(
       (a) =>
-        a.pane_id !== selfPaneId &&
+        (machineId !== null || a.pane_id !== selfPaneId) &&
         (a.agent_status === "blocked" || a.agent_status === "done" || a.agent_status === "working"),
     );
 
+    const limit = machineId ? 6 : 12;
     await Promise.all(
-      candidates.slice(0, 12).map(async (agent) => {
-        const prevRev = lastFetchedRevision.get(agent.pane_id);
-        if (prevRev !== undefined && prevRev === agent.revision && snippetsByPane.has(agent.pane_id)) {
+      candidates.slice(0, limit).map(async (agent) => {
+        const key = makeAgentTimerKey(agent.pane_id, machineId);
+        const prevRev = lastFetchedRevision.get(key);
+        if (prevRev !== undefined && prevRev === agent.revision && snippetsByKey.has(key)) {
           return;
         }
         try {
-          const res = await client.readPane(agent.pane_id, {
-            source: "detection",
-            format: "text",
-            stripAnsi: true,
-          });
-          snippetsByPane.set(agent.pane_id, res.text);
-          lastFetchedRevision.set(agent.pane_id, res.revision);
+          const res = machineId
+            ? await remoteClient.readPane(machineId, agent.pane_id, {
+                source: "detection",
+                format: "text",
+                revision: agent.revision,
+              })
+            : await client.readPane(agent.pane_id, {
+                source: "detection",
+                format: "text",
+                stripAnsi: true,
+              });
+          snippetsByKey.set(key, res.text);
+          lastFetchedRevision.set(key, res.revision || agent.revision);
         } catch {
           // ignore
         }
       }),
     );
+  };
+
+  const refreshRemoteSnapshots = async (forceMachineList = false) => {
+    if (remoteRefreshInFlight || exiting) return;
+    remoteRefreshInFlight = true;
+    const nowMs = Date.now();
+    lastRemoteSnapshotFetchMs = nowMs;
+
+    try {
+      if (forceMachineList || nowMs - lastMachineListFetchMs >= REMOTE_MACHINE_LIST_TTL_MS) {
+        remoteMachines = await remoteClient.listEnabledMachines();
+        lastMachineListFetchMs = Date.now();
+        const activeIds = new Set(remoteMachines.map((m) => m.id));
+        for (const cachedId of [...remoteSnapshots.keys()]) {
+          if (!activeIds.has(cachedId)) {
+            remoteSnapshots.delete(cachedId);
+          }
+        }
+      }
+
+      if (remoteMachines.length === 0 || exiting) {
+        return;
+      }
+
+      let stateDirty = false;
+      await Promise.all(
+        remoteMachines.map(async (machine) => {
+          try {
+            const rSnap = await remoteClient.getSnapshot(machine.id);
+            if (exiting) return;
+            remoteSnapshots.set(machine.id, rSnap);
+            if (reconcileTimersWithSnapshot(persisted, rSnap, Date.now(), machine.id)) {
+              stateDirty = true;
+            }
+            await refreshSnippetsForPriorityAgents(rSnap, machine.id);
+          } catch {
+            // Machine might be temporarily unreachable; keep last known snapshot or skip silently
+          }
+        }),
+      );
+
+      if (exiting) return;
+      if (stateDirty) {
+        saveDeckState(persisted);
+      }
+
+      const prevSelectedKey = selectedItemKey;
+      rebuildItemsFromSnapshot();
+      const vis = getCurrentVisible();
+      if (!selectedItemKey || !vis.some((x) => x.itemKey === selectedItemKey)) {
+        selectedItemKey = vis[0]?.itemKey ?? null;
+      }
+
+      const sel = getSelectedItem();
+      if (sel && sel.itemKey !== prevSelectedKey) {
+        requestSelectedPreview(0);
+      }
+      scheduleRender();
+    } finally {
+      remoteRefreshInFlight = false;
+    }
   };
 
   const refreshSnapshot = async (preserveSelection = true) => {
@@ -282,18 +404,18 @@ export async function runTuiApp(): Promise<void> {
         saveDeckState(persisted);
       }
 
-      await refreshSnippetsForPriorityAgents(snap);
+      await refreshSnippetsForPriorityAgents(snap, null);
 
       rebuildItemsFromSnapshot();
 
       const vis = getCurrentVisible();
-      if (!preserveSelection || !selectedPaneId || !vis.some((x) => x.paneId === selectedPaneId)) {
-        selectedPaneId = vis[0]?.paneId ?? null;
+      if (!preserveSelection || !selectedItemKey || !vis.some((x) => x.itemKey === selectedItemKey)) {
+        selectedItemKey = vis[0]?.itemKey ?? null;
       }
 
       const sel = getSelectedItem();
-      if (sel && previewCache.has(sel.paneId)) {
-        previewText = previewCache.get(sel.paneId)!;
+      if (sel && previewCache.has(sel.itemKey)) {
+        previewText = previewCache.get(sel.itemKey)!;
       }
 
       scheduleRender();
@@ -312,6 +434,9 @@ export async function runTuiApp(): Promise<void> {
       }
     }
   };
+
+  const getLocalAgentPaneIds = (): string[] =>
+    items.filter((x) => !x.machineId).map((x) => x.paneId);
 
   const startSubscriptions = (agentPaneIds: string[]) => {
     subHandle?.close();
@@ -334,14 +459,14 @@ export async function runTuiApp(): Promise<void> {
       },
       onEventsLost: () => {
         void refreshSnapshot(true).then(() => {
-          startSubscriptions(items.map((x) => x.paneId));
+          startSubscriptions(getLocalAgentPaneIds());
         });
       },
       onClose: () => {
         if (!exiting) {
           setTimeout(() => {
             if (!exiting) {
-              startSubscriptions(items.map((x) => x.paneId));
+              startSubscriptions(getLocalAgentPaneIds());
             }
           }, 1200);
         }
@@ -372,35 +497,34 @@ export async function runTuiApp(): Promise<void> {
     process.exit(code);
   };
 
-  const selectPaneById = (nextPaneId: string) => {
-    if (selectedPaneId === nextPaneId) return;
-    selectedPaneId = nextPaneId;
-    const cached = previewCache.get(nextPaneId);
-    if (cached !== undefined) {
-      previewText = cached;
-    }
+  const selectItemByKey = (nextItemKey: string) => {
+    if (selectedItemKey === nextItemKey) return;
+    selectedItemKey = nextItemKey;
+    const cached = previewCache.get(nextItemKey);
+    previewText = cached ?? "";
     scheduleRender();
-    requestSelectedPreview(55);
+    const target = items.find((x) => x.itemKey === nextItemKey);
+    requestSelectedPreview(target?.machineId ? 140 : 55);
   };
 
   const moveSelection = (delta: number) => {
     const vis = getCurrentVisible();
     if (vis.length === 0) return;
-    const idx = vis.findIndex((x) => x.paneId === selectedPaneId);
+    const idx = vis.findIndex((x) => x.itemKey === selectedItemKey);
     const cur = idx === -1 ? 0 : idx;
     const nextIdx = (cur + delta + vis.length) % vis.length;
-    selectPaneById(vis[nextIdx]!.paneId);
+    selectItemByKey(vis[nextIdx]!.itemKey);
   };
 
-  const advanceToNextAttentionItem = (previousPaneId: string) => {
+  const advanceToNextAttentionItem = (previousItemKey: string) => {
     const vis = getCurrentVisible();
     const nextUrgent = vis.find(
       (x) =>
-        x.paneId !== previousPaneId &&
+        x.itemKey !== previousItemKey &&
         (x.group === "needs_you" || x.group === "review"),
     );
     if (nextUrgent) {
-      selectPaneById(nextUrgent.paneId);
+      selectItemByKey(nextUrgent.itemKey);
     }
   };
 
@@ -408,12 +532,28 @@ export async function runTuiApp(): Promise<void> {
     const sel = getSelectedItem();
     if (!sel || exiting) return;
 
-    markAgentSeenInDeck(persisted, {
-      pane_id: sel.paneId,
-      agent_status: sel.rawStatus,
-      completion_seq: sel.completionSeq,
-      revision: sel.revision,
-    });
+    // Remote machines cannot be switched to directly by local Herdr client API;
+    // keep the popup open and show an inline toast so Enter gives clear feedback instead of silent no-op.
+    if (sel.machineId) {
+      setToast(
+        `暂不支持直接跳转到远端 @${sel.machineLabel ?? sel.machineId}，请原地按 [r] 回复或 [y/n/1-4] 审批`,
+        "warn",
+        2800,
+      );
+      return;
+    }
+
+    markAgentSeenInDeck(
+      persisted,
+      {
+        pane_id: sel.paneId,
+        agent_status: sel.rawStatus,
+        completion_seq: sel.completionSeq,
+        revision: sel.revision,
+      },
+      Date.now(),
+      null,
+    );
     saveDeckState(persisted);
 
     const alreadyFocused =
@@ -446,25 +586,37 @@ export async function runTuiApp(): Promise<void> {
     const sel = getSelectedItem();
     if (!sel) return;
     const wasUrgent = sel.group === "needs_you";
+    const machineTag = sel.machineLabel ? `@${sel.machineLabel} ` : "";
     try {
-      await client.sendAgentKeys(sel.paneId, [herdrKey]);
-      setToast(`已发送 [${label ?? herdrKey}] → ${sel.primaryTitle}`, "ok", 2000);
+      if (sel.machineId) {
+        await remoteClient.sendAgentKeys(sel.machineId, sel.paneId, [herdrKey]);
+      } else {
+        await client.sendAgentKeys(sel.paneId, [herdrKey]);
+      }
+      setToast(`已发送 [${label ?? herdrKey}] → ${machineTag}${sel.primaryTitle}`, "ok", 2000);
       setTimeout(() => {
         requestSelectedPreview(0);
-        void refreshSnapshot(true).then(() => {
+        const refreshPromise = sel.machineId
+          ? refreshRemoteSnapshots(false)
+          : refreshSnapshot(true);
+        void refreshPromise.then(() => {
           if (wasUrgent && focusMode === "list") {
-            const updated = items.find((x) => x.paneId === sel.paneId);
+            const updated = items.find((x) => x.itemKey === sel.itemKey);
             if (updated && updated.group !== "needs_you") {
-              advanceToNextAttentionItem(sel.paneId);
+              advanceToNextAttentionItem(sel.itemKey);
             }
           }
         });
-      }, 140);
+      }, sel.machineId ? 300 : 140);
     } catch (err) {
       try {
-        await client.sendPaneKeys(sel.paneId, [herdrKey]);
-        setToast(`已发送 [${label ?? herdrKey}] → ${sel.primaryTitle}`, "ok", 2000);
-        setTimeout(() => requestSelectedPreview(0), 140);
+        if (sel.machineId) {
+          await remoteClient.sendPaneKeys(sel.machineId, sel.paneId, [herdrKey]);
+        } else {
+          await client.sendPaneKeys(sel.paneId, [herdrKey]);
+        }
+        setToast(`已发送 [${label ?? herdrKey}] → ${machineTag}${sel.primaryTitle}`, "ok", 2000);
+        setTimeout(() => requestSelectedPreview(0), sel.machineId ? 300 : 140);
       } catch (err2) {
         setToast(
           `发送按键失败: ${err2 instanceof Error ? err2.message : String(err)}`,
@@ -483,26 +635,43 @@ export async function runTuiApp(): Promise<void> {
       return;
     }
 
+    const machineTag = sel.machineLabel ? `@${sel.machineLabel} ` : "";
     try {
-      await client.sendAgentPrompt(sel.paneId, text);
+      if (sel.machineId) {
+        await remoteClient.sendAgentPrompt(sel.machineId, sel.paneId, text);
+      } else {
+        await client.sendAgentPrompt(sel.paneId, text);
+      }
       replyDraft = "";
       replyCursor = 0;
       focusMode = "list";
-      markAgentSeenInDeck(persisted, {
-        pane_id: sel.paneId,
-        agent_status: sel.rawStatus,
-        completion_seq: sel.completionSeq,
-        revision: sel.revision,
-      });
+      markAgentSeenInDeck(
+        persisted,
+        {
+          pane_id: sel.paneId,
+          agent_status: sel.rawStatus,
+          completion_seq: sel.completionSeq,
+          revision: sel.revision,
+        },
+        Date.now(),
+        sel.machineId,
+      );
       saveDeckState(persisted);
-      setToast(`已发送回复 → ${sel.primaryTitle}`, "ok");
+      setToast(`已发送回复 → ${machineTag}${sel.primaryTitle}`, "ok");
       setTimeout(() => {
-        void refreshSnapshot(true);
-      }, 180);
+        if (sel.machineId) {
+          void refreshRemoteSnapshots(false);
+        } else {
+          void refreshSnapshot(true);
+        }
+      }, sel.machineId ? 350 : 180);
     } catch (err) {
-      if (err instanceof HerdrRpcError && err.code === "agent_blocked") {
+      if (
+        (err instanceof HerdrRpcError || err instanceof HerdrCliError) &&
+        err.code === "agent_blocked"
+      ) {
         setToast(
-          "该 Agent 正卡在审批弹窗，请先用 [y/n/1-4] 审批或按 [Enter] 进入终端处理",
+          "该 Agent 正卡在审批弹窗，请先用 [y/n/1-4] 审批或按 [Enter] 处理",
           "warn",
           4200,
         );
@@ -518,32 +687,47 @@ export async function runTuiApp(): Promise<void> {
   };
 
   const submitPaneRename = async () => {
-    const targetPaneId = renameTargetPaneId ?? getSelectedItem()?.paneId ?? null;
+    const sel = getSelectedItem();
+    const target = renameTargetItem ?? (sel ? { itemKey: sel.itemKey, paneId: sel.paneId, machineId: sel.machineId ?? null } : null);
     const nextLabel = renameDraft.trim() || null;
     focusMode = "list";
-    renameTargetPaneId = null;
+    renameTargetItem = null;
 
-    if (!targetPaneId) {
+    if (!target) {
       scheduleRender();
       return;
     }
 
     try {
-      await client.renamePane(targetPaneId, nextLabel);
-      // Optimistically update local snapshot so card title and color refresh immediately
-      if (snapshot) {
-        const targetPane = snapshot.panes.find((p) => p.pane_id === targetPaneId);
+      if (target.machineId) {
+        await remoteClient.renamePane(target.machineId, target.paneId, nextLabel);
+        const rSnap = remoteSnapshots.get(target.machineId);
+        const targetPane = rSnap?.panes.find((p) => p.pane_id === target.paneId);
         if (targetPane) {
           targetPane.label = nextLabel;
         }
         rebuildItemsFromSnapshot();
+      } else {
+        await client.renamePane(target.paneId, nextLabel);
+        // Optimistically update local snapshot so card title and color refresh immediately
+        if (snapshot) {
+          const targetPane = snapshot.panes.find((p) => p.pane_id === target.paneId);
+          if (targetPane) {
+            targetPane.label = nextLabel;
+          }
+          rebuildItemsFromSnapshot();
+        }
       }
       setToast(
         nextLabel ? `已重命名为「${nextLabel}」` : "已清除自定义 Pane 名称",
         "ok",
         2200,
       );
-      void refreshSnapshot(true);
+      if (target.machineId) {
+        void refreshRemoteSnapshots(false);
+      } else {
+        void refreshSnapshot(true);
+      }
     } catch (err) {
       setToast(
         `重命名失败: ${err instanceof Error ? err.message : String(err)}`,
@@ -555,16 +739,21 @@ export async function runTuiApp(): Promise<void> {
   const markSelectedReviewed = () => {
     const sel = getSelectedItem();
     if (!sel) return;
-    markAgentSeenInDeck(persisted, {
-      pane_id: sel.paneId,
-      agent_status: sel.rawStatus,
-      completion_seq: sel.completionSeq,
-      revision: sel.revision,
-    });
+    markAgentSeenInDeck(
+      persisted,
+      {
+        pane_id: sel.paneId,
+        agent_status: sel.rawStatus,
+        completion_seq: sel.completionSeq,
+        revision: sel.revision,
+      },
+      Date.now(),
+      sel.machineId,
+    );
     saveDeckState(persisted);
     rebuildItemsFromSnapshot();
     setToast(`已将 ${sel.primaryTitle} 标记为已审阅`, "ok", 1800);
-    advanceToNextAttentionItem(sel.paneId);
+    advanceToNextAttentionItem(sel.itemKey);
     scheduleRender();
   };
 
@@ -620,7 +809,8 @@ export async function runTuiApp(): Promise<void> {
       if (key.key === "r") {
         await refreshSnapshot(true);
         triggerGitRefresh(true);
-        setToast("已刷新全部 Agent 状态", "info", 1400);
+        void refreshRemoteSnapshots(true);
+        setToast("已刷新全部本地及远端 Agent 状态", "info", 1400);
         return;
       }
     }
@@ -643,14 +833,14 @@ export async function runTuiApp(): Promise<void> {
         case "g": {
           const vis = getCurrentVisible();
           if (vis[0]) {
-            selectPaneById(vis[0].paneId);
+            selectItemByKey(vis[0].itemKey);
           }
           return;
         }
         case "G": {
           const vis = getCurrentVisible();
           if (vis.length > 0) {
-            selectPaneById(vis[vis.length - 1]!.paneId);
+            selectItemByKey(vis[vis.length - 1]!.itemKey);
           }
           return;
         }
@@ -666,7 +856,11 @@ export async function runTuiApp(): Promise<void> {
           const sel = getSelectedItem();
           if (sel) {
             focusMode = "rename";
-            renameTargetPaneId = sel.paneId;
+            renameTargetItem = {
+              itemKey: sel.itemKey,
+              paneId: sel.paneId,
+              machineId: sel.machineId ?? null,
+            };
             renameDraft = sel.paneLabel ?? "";
             renameCursor = Array.from(renameDraft).length;
             scheduleRender();
@@ -685,8 +879,8 @@ export async function runTuiApp(): Promise<void> {
                 : "all";
           {
             const vis = getCurrentVisible();
-            if (!vis.some((x) => x.paneId === selectedPaneId)) {
-              selectedPaneId = vis[0]?.paneId ?? null;
+            if (!vis.some((x) => x.itemKey === selectedItemKey)) {
+              selectedItemKey = vis[0]?.itemKey ?? null;
               requestSelectedPreview(0);
             }
           }
@@ -696,8 +890,8 @@ export async function runTuiApp(): Promise<void> {
           showIdle = !showIdle;
           {
             const vis = getCurrentVisible();
-            if (!vis.some((x) => x.paneId === selectedPaneId)) {
-              selectedPaneId = vis[0]?.paneId ?? null;
+            if (!vis.some((x) => x.itemKey === selectedItemKey)) {
+              selectedItemKey = vis[0]?.itemKey ?? null;
               requestSelectedPreview(0);
             }
           }
@@ -720,7 +914,7 @@ export async function runTuiApp(): Promise<void> {
             const vis = getCurrentVisible();
             const idx = Number(key.value) - 1;
             if (vis[idx]) {
-              selectPaneById(vis[idx].paneId);
+              selectItemByKey(vis[idx].itemKey);
             }
           } else {
             setToast("当前 Agent 未处于阻塞审批态，按 [r] 回复或 [Enter] 进入终端", "info", 2400);
@@ -826,7 +1020,7 @@ export async function runTuiApp(): Promise<void> {
       (key.kind === "ctrl" && key.key === "c")
     ) {
       focusMode = "list";
-      renameTargetPaneId = null;
+      renameTargetItem = null;
       scheduleRender();
       return;
     }
@@ -880,23 +1074,26 @@ export async function runTuiApp(): Promise<void> {
   process.on("SIGINT", () => void cleanupAndExit(0));
   process.on("SIGTERM", () => void cleanupAndExit(0));
 
-  // Initial load & live subscription
+  // Initial load & live subscription (local renders immediately; remote machines load asynchronously)
   await refreshSnapshot(false);
-  const initialAgentPaneIds = items.map((x) => x.paneId);
-  startSubscriptions(initialAgentPaneIds);
+  const initialLocalPaneIds = getLocalAgentPaneIds();
+  startSubscriptions(initialLocalPaneIds);
+  void refreshRemoteSnapshots(true);
 
-  let knownSubSet = initialAgentPaneIds.join(",");
+  let knownSubSet = initialLocalPaneIds.join(",");
 
-  // Heartbeat for live timers & active preview polling (skip redundant redraws when everything is static)
+  // Heartbeat for live timers, local/remote preview polling, and remote machine snapshots
   previewRefreshTimer = setInterval(() => {
     if (exiting) return;
 
-    const currentSet = items.map((x) => x.paneId).join(",");
+    const localPaneIds = getLocalAgentPaneIds();
+    const currentSet = localPaneIds.join(",");
     if (currentSet !== knownSubSet) {
       knownSubSet = currentSet;
-      startSubscriptions(items.map((x) => x.paneId));
+      startSubscriptions(localPaneIds);
     }
 
+    const nowMs = Date.now();
     const hasActiveTimers = items.some(
       (x) => x.group === "working" || x.group === "needs_you" || x.group === "review",
     );
@@ -911,11 +1108,23 @@ export async function runTuiApp(): Promise<void> {
     }
 
     if (shouldPollPreview) {
-      requestSelectedPreview(0);
+      if (sel.machineId) {
+        if (nowMs - lastRemotePreviewPollMs >= REMOTE_PREVIEW_POLL_INTERVAL_MS) {
+          lastRemotePreviewPollMs = nowMs;
+          requestSelectedPreview(0);
+        } else if (hasActiveTimers) {
+          scheduleRender();
+        }
+      } else {
+        requestSelectedPreview(0);
+      }
     } else if (hasActiveTimers && !showHelp) {
       scheduleRender();
     }
 
     triggerGitRefresh(false);
+    if (nowMs - lastRemoteSnapshotFetchMs >= REMOTE_SNAPSHOT_INTERVAL_MS) {
+      void refreshRemoteSnapshots(false);
+    }
   }, 900);
 }

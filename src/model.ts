@@ -1,3 +1,4 @@
+import { makeAgentTimerKey } from "./state.ts";
 import type {
   AgentInfo,
   AgentStatus,
@@ -36,12 +37,13 @@ export function classifyAttentionGroup(effectiveStatus: AgentStatus): AttentionG
 export function computeEffectiveStatus(
   agent: AgentInfo,
   state: PersistedDeckState,
+  machineId?: string | null,
 ): AgentStatus {
   const raw = agent.agent_status;
   if (raw !== "done") {
     return raw;
   }
-  const timer = state.timers[agent.pane_id];
+  const timer = state.timers[makeAgentTimerKey(agent.pane_id, machineId)];
   if (!timer) {
     return "done";
   }
@@ -290,90 +292,16 @@ export function collectSnapshotGitCwds(
   return [...cwds];
 }
 
-export function buildDeckAgentItems(
-  snapshot: SessionSnapshot,
-  state: PersistedDeckState,
-  snippetsByPane: ReadonlyMap<string, string> = new Map(),
-  excludePaneId?: string | null,
-  nowMs = Date.now(),
-  gitInfoByCwd?: ReadonlyMap<string, GitRepoInfo | null>,
-): DeckAgentItem[] {
-  const workspacesById = new Map<string, WorkspaceInfo>(
-    snapshot.workspaces.map((w) => [w.workspace_id, w]),
-  );
-  const tabsById = new Map<string, TabInfo>(
-    snapshot.tabs.map((t) => [t.tab_id, t]),
-  );
-  const panesById = new Map<string, PaneInfo>(
-    snapshot.panes.map((p) => [p.pane_id, p]),
-  );
+export interface MachineSnapshotSource {
+  machineId?: string | null;
+  machineLabel?: string | null;
+  snapshot: SessionSnapshot;
+  excludePaneId?: string | null;
+  gitInfoByCwd?: ReadonlyMap<string, GitRepoInfo | null>;
+}
 
-  const items: DeckAgentItem[] = [];
-
-  for (const agent of snapshot.agents) {
-    if (excludePaneId && agent.pane_id === excludePaneId) {
-      continue;
-    }
-    const ws = workspacesById.get(agent.workspace_id);
-    const tab = tabsById.get(agent.tab_id);
-    const pane = panesById.get(agent.pane_id);
-
-    const effectiveStatus = computeEffectiveStatus(agent, state);
-    const group = classifyAttentionGroup(effectiveStatus);
-    const timer = state.timers[agent.pane_id];
-    const sinceMs =
-      effectiveStatus === "working"
-        ? (timer?.workingStartedMs ?? timer?.sinceMs ?? nowMs)
-        : (timer?.sinceMs ?? nowMs);
-
-    const agentKind = agent.agent ?? pane?.agent ?? "agent";
-    const agentDisplayName =
-      agent.name ??
-      agent.display_agent ??
-      pane?.display_agent ??
-      agentKind;
-
-    const cwd = resolveAgentCwd(agent, pane, ws);
-    const fallbackBranch = ws?.worktree?.branch ?? ws?.tokens?.branch ?? null;
-    const hasProbed = Boolean(cwd && gitInfoByCwd?.has(cwd));
-    const probedGit = hasProbed && cwd ? (gitInfoByCwd!.get(cwd) ?? null) : null;
-    const gitInfo: GitRepoInfo | null =
-      probedGit ??
-      (!hasProbed && fallbackBranch
-        ? { branch: fallbackBranch, dirtyFiles: 0, ahead: 0, behind: 0 }
-        : null);
-    const branch = gitInfo?.branch ?? null;
-    const workspaceLabel = ws?.label ?? agent.workspace_id;
-    const paneLabel = pane?.label?.trim() || null;
-    const primaryTitle = resolvePrimaryTitle(agent, pane, workspaceLabel, cwd);
-
-    items.push({
-      paneId: agent.pane_id,
-      workspaceId: agent.workspace_id,
-      tabId: agent.tab_id,
-      workspaceLabel,
-      workspaceNumber: ws?.number ?? 999,
-      tabLabel: tab?.label ?? agent.tab_id,
-      paneLabel,
-      primaryTitle,
-      branch,
-      gitInfo,
-      cwd,
-      agentKind,
-      agentDisplayName,
-      rawStatus: agent.agent_status,
-      effectiveStatus,
-      group,
-      sinceMs,
-      summary: extractAgentSummary(agent, pane, snippetsByPane.get(agent.pane_id)),
-      completionSeq: agent.completion_seq ?? null,
-      stateChangeSeq: agent.state_change_seq ?? 0,
-      revision: agent.revision,
-      focusedInHerdr: agent.focused,
-    });
-  }
-
-  items.sort((a, b) => {
+export function sortDeckAgentItems(items: DeckAgentItem[]): DeckAgentItem[] {
+  return items.sort((a, b) => {
     const gp = GROUP_PRIORITY[a.group] - GROUP_PRIORITY[b.group];
     if (gp !== 0) return gp;
 
@@ -388,13 +316,127 @@ export function buildDeckAgentItems(
       if (a.sinceMs !== b.sinceMs) return a.sinceMs - b.sinceMs;
     }
 
+    // Prefer local machine before remote machines within the same priority tie
+    const aRemote = a.machineId ? 1 : 0;
+    const bRemote = b.machineId ? 1 : 0;
+    if (aRemote !== bRemote) return aRemote - bRemote;
+    if (a.machineLabel && b.machineLabel && a.machineLabel !== b.machineLabel) {
+      return a.machineLabel.localeCompare(b.machineLabel);
+    }
+
     if (a.workspaceNumber !== b.workspaceNumber) {
       return a.workspaceNumber - b.workspaceNumber;
     }
-    return a.paneId.localeCompare(b.paneId);
+    return a.itemKey.localeCompare(b.itemKey);
   });
+}
 
-  return items;
+export function buildMultiMachineDeckItems(
+  sources: MachineSnapshotSource[],
+  state: PersistedDeckState,
+  snippetsByKey: ReadonlyMap<string, string> = new Map(),
+  nowMs = Date.now(),
+): DeckAgentItem[] {
+  const items: DeckAgentItem[] = [];
+
+  for (const src of sources) {
+    const { snapshot, machineId = null, machineLabel = null, excludePaneId, gitInfoByCwd } = src;
+    const workspacesById = new Map<string, WorkspaceInfo>(
+      snapshot.workspaces.map((w) => [w.workspace_id, w]),
+    );
+    const tabsById = new Map<string, TabInfo>(
+      snapshot.tabs.map((t) => [t.tab_id, t]),
+    );
+    const panesById = new Map<string, PaneInfo>(
+      snapshot.panes.map((p) => [p.pane_id, p]),
+    );
+
+    for (const agent of snapshot.agents) {
+      if (excludePaneId && agent.pane_id === excludePaneId) {
+        continue;
+      }
+      const ws = workspacesById.get(agent.workspace_id);
+      const tab = tabsById.get(agent.tab_id);
+      const pane = panesById.get(agent.pane_id);
+
+      const itemKey = makeAgentTimerKey(agent.pane_id, machineId);
+      const effectiveStatus = computeEffectiveStatus(agent, state, machineId);
+      const group = classifyAttentionGroup(effectiveStatus);
+      const timer = state.timers[itemKey];
+      const sinceMs =
+        effectiveStatus === "working"
+          ? (timer?.workingStartedMs ?? timer?.sinceMs ?? nowMs)
+          : (timer?.sinceMs ?? nowMs);
+
+      const agentKind = agent.agent ?? pane?.agent ?? "agent";
+      const agentDisplayName =
+        agent.name ??
+        agent.display_agent ??
+        pane?.display_agent ??
+        agentKind;
+
+      const cwd = resolveAgentCwd(agent, pane, ws);
+      const fallbackBranch = ws?.worktree?.branch ?? ws?.tokens?.branch ?? null;
+      const hasProbed = Boolean(!machineId && cwd && gitInfoByCwd?.has(cwd));
+      const probedGit = hasProbed && cwd ? (gitInfoByCwd!.get(cwd) ?? null) : null;
+      const gitInfo: GitRepoInfo | null =
+        probedGit ??
+        (!hasProbed && fallbackBranch
+          ? { branch: fallbackBranch, dirtyFiles: 0, ahead: 0, behind: 0 }
+          : null);
+      const branch = gitInfo?.branch ?? null;
+      const workspaceLabel = ws?.label ?? agent.workspace_id;
+      const paneLabel = pane?.label?.trim() || null;
+      const primaryTitle = resolvePrimaryTitle(agent, pane, workspaceLabel, cwd);
+      const snippet = snippetsByKey.get(itemKey) ?? (!machineId ? snippetsByKey.get(agent.pane_id) : undefined);
+
+      items.push({
+        itemKey,
+        machineId,
+        machineLabel,
+        paneId: agent.pane_id,
+        workspaceId: agent.workspace_id,
+        tabId: agent.tab_id,
+        workspaceLabel,
+        workspaceNumber: ws?.number ?? 999,
+        tabLabel: tab?.label ?? agent.tab_id,
+        paneLabel,
+        primaryTitle,
+        branch,
+        gitInfo,
+        cwd,
+        agentKind,
+        agentDisplayName,
+        rawStatus: agent.agent_status,
+        effectiveStatus,
+        group,
+        sinceMs,
+        summary: extractAgentSummary(agent, pane, snippet),
+        completionSeq: agent.completion_seq ?? null,
+        stateChangeSeq: agent.state_change_seq ?? 0,
+        revision: agent.revision,
+        focusedInHerdr: !machineId && agent.focused,
+      });
+    }
+  }
+
+  return sortDeckAgentItems(items);
+}
+
+export function buildDeckAgentItems(
+  snapshot: SessionSnapshot,
+  state: PersistedDeckState,
+  snippetsByPane: ReadonlyMap<string, string> = new Map(),
+  excludePaneId?: string | null,
+  nowMs = Date.now(),
+  gitInfoByCwd?: ReadonlyMap<string, GitRepoInfo | null>,
+): DeckAgentItem[] {
+  return buildMultiMachineDeckItems(
+    [{ snapshot, excludePaneId, gitInfoByCwd }],
+    state,
+    snippetsByPane,
+    nowMs,
+  );
 }
 
 // Minimal ANSI stripper shared with model

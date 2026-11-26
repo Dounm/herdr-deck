@@ -127,6 +127,15 @@ export interface PersistedDeckState {
 
 export type AttentionGroup = "needs_you" | "review" | "working" | "idle";
 
+export interface MachineProfile {
+  id: string;
+  label: string;
+  target: string;
+  session: string;
+  enabled: boolean;
+  selected: boolean;
+}
+
 export interface GitRepoInfo {
   branch: string;
   dirtyFiles: number;
@@ -136,6 +145,12 @@ export interface GitRepoInfo {
 }
 
 export interface DeckAgentItem {
+  /** Globally unique key across local and remote machines: `paneId` for local, `${machineId}::${paneId}` for remote */
+  itemKey: string;
+  /** null/undefined for local machine; saved machine profile ID for remote machines */
+  machineId?: string | null;
+  /** null/undefined for local machine; display label (e.g. `soltokyo`) for remote machines */
+  machineLabel?: string | null;
   paneId: string;
   workspaceId: string;
   tabId: string;

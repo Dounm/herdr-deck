@@ -96,30 +96,42 @@ function normalizeLifecycleStatus(status: AgentStatus): "working" | "blocked" | 
   return "unknown";
 }
 
+export function makeAgentTimerKey(paneId: string, machineId?: string | null): string {
+  return machineId ? `${machineId}::${paneId}` : paneId;
+}
+
+export function isRemoteTimerKey(key: string): boolean {
+  return key.includes("::");
+}
+
 export function reconcileTimersWithSnapshot(
   state: PersistedDeckState,
   snapshot: SessionSnapshot,
   nowMs = Date.now(),
+  machineId?: string | null,
 ): boolean {
   let dirty = false;
-  const livePaneIds = new Set(snapshot.panes.map((p) => p.pane_id));
+  const liveKeys = new Set(snapshot.panes.map((p) => makeAgentTimerKey(p.pane_id, machineId)));
+  const prefix = machineId ? `${machineId}::` : null;
 
-  for (const paneId of Object.keys(state.timers)) {
-    if (!livePaneIds.has(paneId)) {
-      delete state.timers[paneId];
+  for (const key of Object.keys(state.timers)) {
+    const belongsToThisMachine = prefix ? key.startsWith(prefix) : !isRemoteTimerKey(key);
+    if (belongsToThisMachine && !liveKeys.has(key)) {
+      delete state.timers[key];
       dirty = true;
     }
   }
 
   for (const agent of snapshot.agents) {
-    const existing = state.timers[agent.pane_id];
+    const key = makeAgentTimerKey(agent.pane_id, machineId);
+    const existing = state.timers[key];
     if (!existing) {
-      recordAgentStatusTransition(state, agent.pane_id, agent.agent_status, nowMs);
+      recordAgentStatusTransition(state, key, agent.agent_status, nowMs);
       dirty = true;
       continue;
     }
     if (normalizeLifecycleStatus(existing.status) !== normalizeLifecycleStatus(agent.agent_status)) {
-      recordAgentStatusTransition(state, agent.pane_id, agent.agent_status, nowMs);
+      recordAgentStatusTransition(state, key, agent.agent_status, nowMs);
       dirty = true;
     } else if (existing.status !== agent.agent_status) {
       existing.status = agent.agent_status;
@@ -134,8 +146,10 @@ export function markAgentSeenInDeck(
   state: PersistedDeckState,
   agent: Pick<AgentInfo, "pane_id" | "agent_status" | "completion_seq" | "revision">,
   nowMs = Date.now(),
+  machineId?: string | null,
 ): void {
-  const entry = state.timers[agent.pane_id] ?? {
+  const key = makeAgentTimerKey(agent.pane_id, machineId);
+  const entry = state.timers[key] ?? {
     status: agent.agent_status,
     sinceMs: nowMs,
   };
@@ -143,7 +157,7 @@ export function markAgentSeenInDeck(
     entry.seenCompletionSeq = agent.completion_seq;
   }
   entry.seenRevision = agent.revision;
-  state.timers[agent.pane_id] = entry;
+  state.timers[key] = entry;
 }
 
 export function formatDurationCompact(elapsedMs: number): string {
