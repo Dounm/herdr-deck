@@ -3,6 +3,11 @@ import {
   DIM,
   fitAnsiColumns,
   GRUVBOX,
+  layoutEditableInput,
+  pickNameColor,
+  renderBoxBottom,
+  renderBoxRow,
+  renderBoxTop,
   RESET,
   sanitizePreviewAnsiLine,
   style,
@@ -11,7 +16,7 @@ import {
 import { formatDurationCompact, formatRelativeAge } from "./state.ts";
 import type { AttentionGroup, DeckAgentItem } from "./types.ts";
 
-export type UiFocusMode = "list" | "interact" | "reply";
+export type UiFocusMode = "list" | "reply";
 export type FilterTab = "all" | "attention" | "working";
 
 export interface RenderState {
@@ -22,9 +27,10 @@ export interface RenderState {
   focusMode: UiFocusMode;
   filterTab: FilterTab;
   showIdle: boolean;
+  showHelp: boolean;
   previewText: string;
-  previewScrollOffset: number;
   replyDraft: string;
+  replyCursor: number;
   toastMessage: string | null;
   toastKind: "info" | "ok" | "warn" | "error";
   spinnerTick: number;
@@ -52,7 +58,6 @@ export function getVisibleItems(state: RenderState): DeckAgentItem[] {
       return item.group === "working" || item.group === "needs_you";
     }
     if (!state.showIdle && item.group === "idle") {
-      // Still show idle items if there are no active items at all
       const hasNonIdle = state.items.some((x) => x.group !== "idle");
       return !hasNonIdle;
     }
@@ -61,8 +66,8 @@ export function getVisibleItems(state: RenderState): DeckAgentItem[] {
 }
 
 export function renderScreen(state: RenderState): string {
-  const cols = Math.max(40, state.cols);
-  const rows = Math.max(12, state.rows);
+  const cols = Math.max(44, state.cols);
+  const rows = Math.max(14, state.rows);
 
   const visibleItems = getVisibleItems(state);
   const selectedItem =
@@ -75,51 +80,70 @@ export function renderScreen(state: RenderState): string {
   // 1. Top Header Bar (1 row)
   lines.push(renderTopBar(state, cols));
 
-  // 2. Main Split Body (rows - 3 rows: top bar, action/input bar, footer help bar)
-  const bodyRows = Math.max(6, rows - 3);
-  const stacked = cols < 78;
+  // 2. Main Body (rows - 2 rows: top bar + footer bar)
+  const bodyRows = Math.max(8, rows - 2);
+  let hardwareCursor: { row: number; col: number } | null = null;
 
-  if (stacked) {
-    const topRows = Math.max(3, Math.floor(bodyRows * 0.42));
-    const bottomRows = Math.max(3, bodyRows - topRows - 1);
-    const leftLines = renderAgentListPane(state, visibleItems, selectedItem?.paneId ?? null, cols, topRows);
-    const divider = style("─".repeat(cols), GRUVBOX.darkGray);
-    const rightLines = renderPreviewPane(state, selectedItem, cols, bottomRows);
-    lines.push(...leftLines, divider, ...rightLines);
+  if (state.showHelp) {
+    lines.push(...renderCheatsheetBody(cols, bodyRows));
   } else {
-    const leftWidth = Math.min(48, Math.max(32, Math.floor(cols * 0.36)));
-    const rightWidth = Math.max(20, cols - leftWidth - 1);
-    const leftLines = renderAgentListPane(
-      state,
-      visibleItems,
-      selectedItem?.paneId ?? null,
-      leftWidth,
-      bodyRows,
-    );
-    const rightLines = renderPreviewPane(state, selectedItem, rightWidth, bodyRows);
-    const sepGlyph =
-      state.focusMode === "interact"
-        ? style("┃", GRUVBOX.orange, BOLD)
-        : style("│", GRUVBOX.darkGray);
-
-    for (let r = 0; r < bodyRows; r++) {
-      const l = leftLines[r] ?? " ".repeat(leftWidth);
-      const rt = rightLines[r] ?? " ".repeat(rightWidth);
-      lines.push(`${l}${sepGlyph}${rt}`);
+    const stacked = cols < 82;
+    if (stacked) {
+      const topRows = Math.max(5, Math.floor(bodyRows * 0.42));
+      const bottomRows = Math.max(5, bodyRows - topRows);
+      const leftLines = renderAgentListCard(
+        state,
+        visibleItems,
+        selectedItem?.paneId ?? null,
+        cols,
+        topRows,
+      );
+      const rightCol = renderRightColumn(state, selectedItem, cols, bottomRows, 1, 1 + topRows);
+      hardwareCursor = rightCol.cursor;
+      lines.push(...leftLines, ...rightCol.lines);
+    } else {
+      const leftWidth = Math.min(50, Math.max(34, Math.floor(cols * 0.36)));
+      const rightWidth = Math.max(24, cols - leftWidth);
+      const leftLines = renderAgentListCard(
+        state,
+        visibleItems,
+        selectedItem?.paneId ?? null,
+        leftWidth,
+        bodyRows,
+      );
+      const rightCol = renderRightColumn(
+        state,
+        selectedItem,
+        rightWidth,
+        bodyRows,
+        leftWidth + 1,
+        2,
+      );
+      hardwareCursor = rightCol.cursor;
+      for (let r = 0; r < bodyRows; r++) {
+        const l = leftLines[r] ?? " ".repeat(leftWidth);
+        const rt = rightCol.lines[r] ?? " ".repeat(rightWidth);
+        lines.push(`${l}${rt}`);
+      }
     }
   }
 
-  // 3. Bottom Reply / Status Bar (1 row)
-  lines.push(renderPromptOrToastBar(state, selectedItem, cols));
+  // 3. Compact Footer Bar (1 row)
+  lines.push(renderFooterBar(state, cols));
 
-  // 4. Footer Keybinding Legend (1 row)
-  lines.push(renderFooterBar(state, selectedItem, cols));
+  // Wrap frame with DEC 2026 Synchronized Output (BSU/ESU) + disable line auto-wrap (DECAWM off)
+  // + explicit 1-based row positioning (\x1b[r;1H) per line so an exotic wide glyph in the right
+  // preview pane can NEVER wrap and scroll Row 1 (Top Bar) off the top of the viewport.
+  const body = lines
+    .slice(0, rows)
+    .map((line, idx) => `\x1b[${idx + 1};1H${line}\x1b[K`)
+    .join("");
 
-  // Paint frame cleanly from top-left without full clear flicker
-  return (
-    "\x1b[?25l\x1b[H" +
-    lines.slice(0, rows).map((line) => `${line}\x1b[K`).join("\r\n")
-  );
+  const cursorSuffix = hardwareCursor
+    ? `\x1b[${hardwareCursor.row};${hardwareCursor.col}H\x1b[6 q\x1b[?25h`
+    : "\x1b[?25l";
+
+  return `\x1b[?2026h\x1b[?7l\x1b[?25l${body}${cursorSuffix}\x1b[?2026l`;
 }
 
 function renderTopBar(state: RenderState, cols: number): string {
@@ -137,33 +161,33 @@ function renderTopBar(state: RenderState, cols: number): string {
 
   const badges: string[] = [];
   if (counts.needs_you > 0) {
-    badges.push(`${GRUVBOX.bg1}${GRUVBOX.red}${BOLD} ! ${counts.needs_you} Needs You ${RESET}`);
+    badges.push(`${GRUVBOX.bgUrgent}${GRUVBOX.red}${BOLD} ! ${counts.needs_you} 待审批 ${RESET}`);
   } else {
-    badges.push(`${GRUVBOX.bg1}${GRUVBOX.gray} · 0 Blocked ${RESET}`);
+    badges.push(`${GRUVBOX.bg1}${GRUVBOX.gray} · 0 阻塞 ${RESET}`);
   }
 
   if (counts.review > 0) {
-    badges.push(`${GRUVBOX.bg1}${GRUVBOX.green}${BOLD} ✓ ${counts.review} Review ${RESET}`);
+    badges.push(`${GRUVBOX.bg1}${GRUVBOX.green}${BOLD} ✓ ${counts.review} 待审阅 ${RESET}`);
   }
 
   const spin = SPINNER_FRAMES[state.spinnerTick % SPINNER_FRAMES.length]!;
   if (counts.working > 0) {
-    badges.push(`${GRUVBOX.bg1}${GRUVBOX.yellow} ${spin} ${counts.working} Working ${RESET}`);
+    badges.push(`${GRUVBOX.bg1}${GRUVBOX.yellow} ${spin} ${counts.working} 运行中 ${RESET}`);
   }
 
   badges.push(
-    `${GRUVBOX.bg1}${GRUVBOX.gray} ○ ${counts.idle} Idle${state.showIdle ? "" : " (hidden)"} ${RESET}`,
+    `${GRUVBOX.bg1}${GRUVBOX.gray} ○ ${counts.idle} 空闲${state.showIdle ? "" : " (隐藏)"} ${RESET}`,
   );
 
   const filterTag =
     state.filterTab === "all"
-      ? "Filter: All"
+      ? "全部"
       : state.filterTab === "attention"
-        ? "Filter: Attention"
-        : "Filter: Active";
+        ? "仅待办"
+        : "活跃";
 
   const leftPart = `${brandLabel} ${badges.join(" ")}`;
-  const rightPart = `${GRUVBOX.bg1}${GRUVBOX.fg3} ${filterTag} [f] ${RESET}`;
+  const rightPart = `${GRUVBOX.bg1}${GRUVBOX.fg3} [f] ${filterTag} ${RESET}`;
 
   const leftW = visibleWidth(leftPart);
   const rightW = visibleWidth(rightPart);
@@ -176,7 +200,38 @@ function renderTopBar(state: RenderState, cols: number): string {
   return fitAnsiColumns(leftPart, cols, { pad: true, padBg: GRUVBOX.bg0Hard });
 }
 
-function renderAgentListPane(
+function renderAgentListCard(
+  state: RenderState,
+  visibleItems: DeckAgentItem[],
+  selectedPaneId: string | null,
+  width: number,
+  height: number,
+): string[] {
+  const isFocused = state.focusMode === "list";
+  const borderColor = isFocused ? GRUVBOX.orange : GRUVBOX.darkGray;
+  const titleColor = isFocused ? `${BOLD}${GRUVBOX.orange}` : GRUVBOX.fg3;
+  const title = `${titleColor}Agent 队列${RESET}`;
+  const countTag = `${GRUVBOX.gray}${visibleItems.length}/${state.items.length}${RESET}`;
+
+  const innerWidth = Math.max(4, width - 2);
+  const innerHeight = Math.max(1, height - 2);
+  const innerLines = renderAgentListInner(
+    state,
+    visibleItems,
+    selectedPaneId,
+    innerWidth,
+    innerHeight,
+  );
+
+  const out: string[] = [renderBoxTop(title, countTag, width, borderColor)];
+  for (let i = 0; i < innerHeight; i++) {
+    out.push(renderBoxRow(innerLines[i] ?? "", width, borderColor));
+  }
+  out.push(renderBoxBottom(width, borderColor));
+  return out;
+}
+
+function renderAgentListInner(
   state: RenderState,
   visibleItems: DeckAgentItem[],
   selectedPaneId: string | null,
@@ -190,7 +245,7 @@ function renderAgentListPane(
       if (r === mid) {
         emptyLines.push(
           fitAnsiColumns(
-            style("  ✓ Inbox Zero — no matching agents", GRUVBOX.green, BOLD),
+            style("  ✓ Inbox Zero — 暂无匹配 Agent", GRUVBOX.green, BOLD),
             width,
             { pad: true },
           ),
@@ -198,8 +253,8 @@ function renderAgentListPane(
       } else if (r === mid + 1) {
         const hint =
           state.items.length > 0
-            ? "  Press [z] to show idle agents or [f] to reset filter"
-            : "  Start Claude / Codex / Agy in any Herdr pane";
+            ? "  按 [z] 显示空闲或 [f] 切换过滤"
+            : "  在任意 Herdr Pane 启动 Claude / Codex / Agy";
         emptyLines.push(fitAnsiColumns(style(hint, GRUVBOX.gray), width, { pad: true }));
       } else {
         emptyLines.push(" ".repeat(width));
@@ -208,7 +263,6 @@ function renderAgentListPane(
     return emptyLines;
   }
 
-  // Build logical rows with track of where selected item lands so we auto-scroll viewport
   interface LogicalRow {
     text: string;
     paneId?: string;
@@ -225,9 +279,15 @@ function renderAgentListPane(
     if (rows.length > 0) {
       rows.push({ text: " ".repeat(width) });
     }
-    const headerLabel = ` ▾ ${meta.title} (${groupItems.length}) `;
+
+    // Group rule header: ` ─ ! NEEDS YOU (1) ─────────────`
+    const headerCore = ` ─ ${meta.badge} ${meta.title} (${groupItems.length}) `;
+    const fillLen = Math.max(0, width - visibleWidth(headerCore) - 1);
+    const headerLine =
+      `${meta.color}${BOLD}${headerCore}${RESET}` +
+      `${GRUVBOX.darkGray}${"─".repeat(fillLen)}${RESET}`;
     rows.push({
-      text: fitAnsiColumns(style(headerLabel, meta.color, BOLD), width, { pad: true }),
+      text: fitAnsiColumns(headerLine, width, { pad: true }),
     });
 
     for (const item of groupItems) {
@@ -238,7 +298,6 @@ function renderAgentListPane(
     }
   }
 
-  // Viewport scrolling around selected item
   let selFirstRow = 0;
   let selLastRow = 0;
   for (let i = 0; i < rows.length; i++) {
@@ -277,9 +336,7 @@ function renderAgentCardRows(
       : GRUVBOX.bg1
     : "";
 
-  const cursorBar = isSelected
-    ? `${rowBg}${GRUVBOX.orange}${BOLD}▌`
-    : " ";
+  const cursorBar = isSelected ? `${rowBg}${GRUVBOX.orange}${BOLD}▌` : " ";
 
   const spin = SPINNER_FRAMES[state.spinnerTick % SPINNER_FRAMES.length]!;
   let icon = "○";
@@ -305,8 +362,11 @@ function renderAgentCardRows(
     timerStr = item.paneId;
   }
 
-  const titleColor = isSelected ? `${BOLD}${GRUVBOX.fg0}` : GRUVBOX.fg1;
-  const agentTagColor = isSelected ? GRUVBOX.aqua : GRUVBOX.fg3;
+  // Distinct deterministic color per primaryTitle so multiple agents in one workspace stand out immediately
+  const nameColor = pickNameColor(item.primaryTitle);
+  const titleStyle = isSelected ? `${BOLD}${nameColor}` : nameColor;
+  const currentDot = item.focusedInHerdr ? `${rowBg}${GRUVBOX.fg3} •${RESET}` : "";
+
   const timerColor =
     item.group === "needs_you"
       ? `${BOLD}${GRUVBOX.orange}`
@@ -322,8 +382,7 @@ function renderAgentCardRows(
 
   const leftHeadline =
     `${cursorBar}${rowBg}${iconColor}${BOLD}${icon}${RESET}` +
-    `${rowBg} ${titleColor}${item.workspaceLabel}${RESET}` +
-    `${rowBg}${GRUVBOX.gray} · ${agentTagColor}${item.agentDisplayName}${RESET}`;
+    `${rowBg} ${titleStyle}${item.primaryTitle}${RESET}${currentDot}`;
 
   const fittedLeft = fitAnsiColumns(leftHeadline, leftBudget, {
     pad: true,
@@ -335,9 +394,23 @@ function renderAgentCardRows(
     padBg: rowBg || undefined,
   });
 
+  // Line 2: compact meta (`workspace · agent`) + cleaned summary
+  const subPrefix = isSelected
+    ? `${rowBg}${GRUVBOX.orange}${BOLD}▌${RESET}${rowBg}  `
+    : "   ";
+  const showWorkspaceInMeta =
+    item.primaryTitle.toLowerCase() !== item.workspaceLabel.toLowerCase();
+  const metaTag = showWorkspaceInMeta
+    ? `${item.workspaceLabel}·${item.agentDisplayName}`
+    : item.agentDisplayName;
+  const metaColor = isSelected ? GRUVBOX.fg3 : GRUVBOX.darkGray;
   const summaryColor = isSelected ? GRUVBOX.fg2 : GRUVBOX.gray;
-  const subPrefix = isSelected ? `${rowBg}${GRUVBOX.orange}${BOLD}▌${RESET}${rowBg}   ` : "    ";
-  const line2Raw = `${subPrefix}${summaryColor}${item.summary}${RESET}`;
+
+  const line2Raw =
+    `${subPrefix}${metaColor}${metaTag}${RESET}` +
+    `${rowBg}${GRUVBOX.darkGray} │ ${RESET}` +
+    `${rowBg}${summaryColor}${item.summary}${RESET}`;
+
   const line2 = fitAnsiColumns(line2Raw, width, {
     pad: true,
     padBg: rowBg || undefined,
@@ -346,121 +419,170 @@ function renderAgentCardRows(
   return [line1, line2];
 }
 
-function renderPreviewPane(
+function renderRightColumn(
+  state: RenderState,
+  selected: DeckAgentItem | null,
+  width: number,
+  height: number,
+  startCol1Based: number,
+  startRow1Based: number,
+): { lines: string[]; cursor: { row: number; col: number } | null } {
+  // Reserve fixed 3-row rounded reply/action box at the bottom of the right column
+  const replyBoxHeight = 3;
+  const previewBoxHeight = Math.max(4, height - replyBoxHeight);
+
+  const previewLines = renderPreviewCard(state, selected, width, previewBoxHeight);
+  const replyStartRow = startRow1Based + previewBoxHeight;
+  const reply = renderInlineReplyCard(
+    state,
+    selected,
+    width,
+    replyBoxHeight,
+    startCol1Based,
+    replyStartRow,
+  );
+
+  return {
+    lines: [...previewLines, ...reply.lines],
+    cursor: reply.cursor,
+  };
+}
+
+function renderPreviewCard(
   state: RenderState,
   selected: DeckAgentItem | null,
   width: number,
   height: number,
 ): string[] {
+  const isBlocked = selected?.group === "needs_you";
+  const borderColor =
+    isBlocked && state.focusMode !== "reply" ? GRUVBOX.red : GRUVBOX.darkGray;
+
+  let headerTitle = `${GRUVBOX.gray}终端快照${RESET}`;
+  let rightTag = "";
+
+  if (selected) {
+    const titleColor = pickNameColor(selected.primaryTitle);
+    const branchPart = selected.branch ? ` ${GRUVBOX.aqua}⎇ ${selected.branch}${RESET}` : "";
+    const cwdPart = selected.cwd ? ` ${GRUVBOX.gray}${shortenHome(selected.cwd)}${RESET}` : "";
+    headerTitle =
+      `${titleColor}${BOLD}${selected.primaryTitle}${RESET}` +
+      `${GRUVBOX.gray} · ${GRUVBOX.fg3}${selected.workspaceLabel} › ${selected.tabLabel} › ${GRUVBOX.yellow}${selected.agentDisplayName}${RESET}` +
+      branchPart +
+      (width >= 88 ? cwdPart : "");
+
+    if (isBlocked) {
+      rightTag = `${GRUVBOX.bgUrgent}${GRUVBOX.red}${BOLD} ! 待审批 ${RESET}`;
+    } else {
+      rightTag = `${GRUVBOX.gray}${selected.paneId}${RESET}`;
+    }
+  }
+
+  const innerWidth = Math.max(4, width - 2);
+  const innerHeight = Math.max(1, height - 2);
+
+  const out: string[] = [renderBoxTop(headerTitle, rightTag, width, borderColor)];
+
   if (!selected) {
-    return Array.from({ length: height }, () => " ".repeat(width));
+    for (let i = 0; i < innerHeight; i++) {
+      out.push(renderBoxRow("", width, borderColor));
+    }
+    out.push(renderBoxBottom(width, borderColor));
+    return out;
   }
 
-  const lines: string[] = [];
-
-  // Row 0: Detail header with workspace > tab > branch > pane_id + mode pill
-  const modePill =
-    state.focusMode === "interact"
-      ? `${GRUVBOX.bgInteract}${GRUVBOX.green}${BOLD} » LIVE KEYS → AGENT (Esc to exit) ${RESET}`
-      : selected.group === "needs_you"
-        ? `${GRUVBOX.bgUrgent}${GRUVBOX.red}${BOLD} ! BLOCKED — [y/n/1-4] or [Tab] interact ${RESET}`
-        : `${GRUVBOX.bg1}${GRUVBOX.fg3} ${selected.paneId} ${RESET}`;
-
-  const branchChip = selected.branch
-    ? `${GRUVBOX.gray} › ${GRUVBOX.aqua}⎇ ${selected.branch}${RESET}`
-    : "";
-
-  const headerLeft =
-    ` ${GRUVBOX.blue}${BOLD}${selected.workspaceLabel}${RESET}` +
-    `${GRUVBOX.gray} › ${GRUVBOX.fg2}${selected.tabLabel}${RESET}` +
-    branchChip +
-    `${GRUVBOX.gray} › ${GRUVBOX.yellow}${selected.agentDisplayName}${RESET}`;
-
-  const leftW = visibleWidth(headerLeft);
-  const pillW = visibleWidth(modePill);
-  if (leftW + pillW + 2 <= width) {
-    lines.push(
-      `${headerLeft}${" ".repeat(width - leftW - pillW - 1)}${modePill} `,
-    );
-  } else {
-    lines.push(fitAnsiColumns(headerLeft, width, { pad: true }));
-  }
-
-  // Row 1: Subtle divider with CWD if available
-  const cwdLabel = selected.cwd ? shortenHome(selected.cwd) : "";
-  const dividerRule = cwdLabel
-    ? `─ ${cwdLabel} ${"─".repeat(Math.max(1, width - visibleWidth(cwdLabel) - 4))}`
-    : "─".repeat(width);
-  lines.push(
-    fitAnsiColumns(
-      style(dividerRule, state.focusMode === "interact" ? GRUVBOX.orange : GRUVBOX.darkGray),
-      width,
-      { pad: true },
-    ),
-  );
-
-  // Remaining rows: terminal snapshot
-  const snapHeight = Math.max(1, height - 2);
   const rawLines = state.previewText
     ? state.previewText.replace(/\r\n/g, "\n").split("\n")
     : [];
 
-  // Trim trailing completely blank lines from bottom of terminal capture so actual prompt/blocker sits nicely visible
+  // Trim trailing empty lines so the live prompt / approval card stays pinned neatly at bottom
   while (rawLines.length > 0 && visibleWidth(rawLines[rawLines.length - 1]!.trim()) === 0) {
     rawLines.pop();
   }
 
   if (rawLines.length === 0) {
-    for (let i = 0; i < snapHeight; i++) {
-      if (i === Math.floor(snapHeight / 2)) {
-        lines.push(
-          fitAnsiColumns(style("  (Waiting for terminal output…)", GRUVBOX.gray, DIM), width, {
-            pad: true,
-          }),
-        );
-      } else {
-        lines.push(" ".repeat(width));
-      }
+    const mid = Math.floor(innerHeight / 2);
+    for (let i = 0; i < innerHeight; i++) {
+      const content =
+        i === mid ? style("  (正在加载终端画面…)", GRUVBOX.gray, DIM) : "";
+      out.push(renderBoxRow(content, width, borderColor));
     }
-    return lines;
+    out.push(renderBoxBottom(width, borderColor));
+    return out;
   }
 
-  const maxOffset = Math.max(0, rawLines.length - snapHeight);
-  const clampedOffset = Math.min(maxOffset, Math.max(0, state.previewScrollOffset));
-  const endIdx = rawLines.length - clampedOffset;
-  const startIdx = Math.max(0, endIdx - snapHeight);
-  const slice = rawLines.slice(startIdx, endIdx);
+  // Always show the latest bottom lines (no preview scrolling; press Enter to scroll in real terminal)
+  const startIdx = Math.max(0, rawLines.length - innerHeight);
+  const slice = rawLines.slice(startIdx);
+  const contentCols = Math.max(2, innerWidth - 2);
 
-  const innerWidth = Math.max(4, width - 2);
-  for (let i = 0; i < snapHeight; i++) {
+  for (let i = 0; i < innerHeight; i++) {
     const raw = slice[i];
     if (raw === undefined) {
-      lines.push(" ".repeat(width));
+      out.push(renderBoxRow("", width, borderColor));
     } else {
       const safe = sanitizePreviewAnsiLine(raw);
-      lines.push(" " + fitAnsiColumns(safe, innerWidth, { pad: true, ellipsis: "…" }) + " ");
+      const fitted = fitAnsiColumns(safe, contentCols, { pad: true, ellipsis: "…" });
+      out.push(renderBoxRow(` ${fitted} `, width, borderColor));
     }
   }
 
-  return lines;
+  out.push(renderBoxBottom(width, borderColor));
+  return out;
 }
 
-function renderPromptOrToastBar(
+function renderInlineReplyCard(
   state: RenderState,
   selected: DeckAgentItem | null,
-  cols: number,
-): string {
-  if (state.focusMode === "reply") {
-    const targetName = selected
-      ? `${selected.workspaceLabel}/${selected.agentDisplayName}`
-      : "agent";
-    const prefix = `${GRUVBOX.bg2}${GRUVBOX.yellow}${BOLD} Reply → ${targetName} ❯ ${RESET}${GRUVBOX.bg1}${GRUVBOX.fg0} `;
-    const cursor = `${GRUVBOX.orange}█${RESET}`;
-    const line = `${prefix}${state.replyDraft}${cursor}`;
-    return fitAnsiColumns(line, cols, { pad: true, padBg: GRUVBOX.bg1 });
-  }
+  width: number,
+  height: number,
+  startCol1Based: number,
+  startRow1Based: number,
+): { lines: string[]; cursor: { row: number; col: number } | null } {
+  const isReply = state.focusMode === "reply";
+  const isBlocked = selected?.group === "needs_you";
 
-  if (state.toastMessage) {
+  const borderColor = isReply
+    ? GRUVBOX.yellow
+    : isBlocked
+      ? GRUVBOX.orange
+      : GRUVBOX.darkGray;
+
+  const targetName = selected ? selected.primaryTitle : "Agent";
+  const title = isReply
+    ? `${GRUVBOX.yellow}${BOLD}回复 → ${targetName}${RESET}`
+    : isBlocked
+      ? `${GRUVBOX.orange}${BOLD}快速审批 / 回复${RESET}`
+      : `${GRUVBOX.fg3}快速回复${RESET}`;
+
+  const rightTag = isReply
+    ? `${GRUVBOX.gray}Enter 发送 · Esc 取消${RESET}`
+    : isBlocked
+      ? `${GRUVBOX.gray}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
+      : `${GRUVBOX.gray}[r] 输入 · [Enter] 进终端${RESET}`;
+
+  let content = "";
+  let rowBg: string | undefined;
+  let cursor: { row: number; col: number } | null = null;
+
+  if (isReply) {
+    rowBg = GRUVBOX.bg1;
+    // Inner width excludes left/right │ borders (2 cols) and leading " ❯ " prompt (3 cols)
+    const innerWidth = Math.max(4, width - 2);
+    const promptPrefixWidth = 3;
+    const inputCols = Math.max(2, innerWidth - promptPrefixWidth);
+    const { visibleText, cursorCellOffset } = layoutEditableInput(
+      state.replyDraft,
+      state.replyCursor,
+      inputCols,
+    );
+    content = `${GRUVBOX.bg1}${GRUVBOX.yellow}${BOLD} ❯ ${RESET}${GRUVBOX.bg1}${GRUVBOX.fg0}${visibleText}${RESET}`;
+    // 1-based cursor coordinates inside the reply input row
+    cursor = {
+      row: startRow1Based + 1,
+      col: startCol1Based + 1 + promptPrefixWidth + cursorCellOffset,
+    };
+  } else if (state.toastMessage) {
     const color =
       state.toastKind === "error"
         ? GRUVBOX.red
@@ -469,62 +591,147 @@ function renderPromptOrToastBar(
           : state.toastKind === "ok"
             ? GRUVBOX.green
             : GRUVBOX.aqua;
-    return fitAnsiColumns(
-      `${GRUVBOX.bg1}${color}${BOLD} ✦ ${state.toastMessage}${RESET}`,
-      cols,
-      { pad: true, padBg: GRUVBOX.bg1 },
-    );
+    content = `${color}${BOLD} ✦ ${state.toastMessage}${RESET}`;
+  } else if (!selected) {
+    content = `${GRUVBOX.gray} 暂无可操作 Agent${RESET}`;
+  } else if (isBlocked) {
+    rowBg = GRUVBOX.bgUrgent;
+    content = `${GRUVBOX.bgUrgent}${GRUVBOX.orange}${BOLD} ❯ ${RESET}${GRUVBOX.bgUrgent}${GRUVBOX.fg1}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项 · 或 [Enter] 进入终端处理${RESET}`;
+  } else {
+    content = `${GRUVBOX.gray} ❯ 按 ${GRUVBOX.fg2}[r]${GRUVBOX.gray} 一句话派活给 ${pickNameColor(targetName)}${targetName}${GRUVBOX.gray}，或 ${GRUVBOX.fg2}[Enter]${GRUVBOX.gray} 深入终端${RESET}`;
   }
 
-  if (!selected) {
-    return fitAnsiColumns(style("─".repeat(cols), GRUVBOX.darkGray), cols, { pad: true });
+  const out: string[] = [renderBoxTop(title, rightTag, width, borderColor)];
+  if (height >= 3) {
+    out.push(renderBoxRow(content, width, borderColor, rowBg));
   }
-
-  if (selected.group === "needs_you") {
-    return fitAnsiColumns(
-      `${GRUVBOX.bgUrgent}${GRUVBOX.orange}${BOLD} ! Quick Approve:${RESET}${GRUVBOX.bgUrgent}${GRUVBOX.fg1} press [y] Yes · [n] No · [1-4] Option · or [Tab] to drive dialog with ↑/↓/Enter${RESET}`,
-      cols,
-      { pad: true, padBg: GRUVBOX.bgUrgent },
-    );
-  }
-
-  return fitAnsiColumns(
-    `${GRUVBOX.bg1}${GRUVBOX.gray} Press [r] or [/] to send an inline prompt to ${GRUVBOX.fg2}${selected.workspaceLabel}/${selected.agentDisplayName}${GRUVBOX.gray}, or [Enter] to dive into terminal${RESET}`,
-    cols,
-    { pad: true, padBg: GRUVBOX.bg1 },
-  );
+  out.push(renderBoxBottom(width, borderColor));
+  return { lines: out, cursor };
 }
 
-function renderFooterBar(
-  state: RenderState,
-  selected: DeckAgentItem | null,
-  cols: number,
-): string {
+function renderCheatsheetBody(cols: number, height: number): string[] {
+  const modalWidth = Math.min(72, Math.max(44, cols - 6));
+  const padLeft = Math.floor((cols - modalWidth) / 2);
+  const padRight = Math.max(0, cols - padLeft - modalWidth);
+
+  const sections: Array<{ heading: string; rows: Array<[string, string]> }> = [
+    {
+      heading: "导航与跳转",
+      rows: [
+        ["j / k / ↑ / ↓", "上下切换 Agent，右侧实时预览最新输出"],
+        ["g / G", "跳到队列顶部 / 底部"],
+        ["Enter", "深入进入选中 Agent 的真实终端并关闭面板"],
+        ["q / Esc", "关闭 Herdr Deck 弹窗"],
+      ],
+    },
+    {
+      heading: "原地审批与内联回复",
+      rows: [
+        ["y / n / a / 1-4", "选中「待审批」项时直接发送审批按键"],
+        ["r / /", "聚焦右下角输入框，一句话发送给选中 Agent"],
+        ["← / → / Ctrl+A/E", "输入框内移动光标编辑（支持中文输入法）"],
+        ["Ctrl+U / Ctrl+W", "清空光标前文本 / 删除前一个词"],
+      ],
+    },
+    {
+      heading: "队列管理",
+      rows: [
+        ["m / Space", "将「待审阅」项标记为已阅并移向下一待办"],
+        ["f", "循环切换过滤视图（全部 / 仅待办 / 活跃）"],
+        ["z", "展开或隐藏 IDLE 空闲分组"],
+        ["Ctrl+r", "立即手动刷新全量快照"],
+        ["?", "打开 / 关闭本快捷键速查表"],
+      ],
+    },
+  ];
+
+  const modalRows: string[] = [];
+  const innerWidth = modalWidth - 2;
+  const bg = GRUVBOX.bgModal;
+
+  modalRows.push(
+    renderBoxTop(
+      `${GRUVBOX.orange}${BOLD}Herdr Deck 快捷键速查${RESET}`,
+      `${GRUVBOX.gray}? / Esc 关闭${RESET}`,
+      modalWidth,
+      GRUVBOX.orange,
+      bg,
+    ),
+  );
+
+  for (let s = 0; s < sections.length; s++) {
+    const sec = sections[s]!;
+    if (s > 0) {
+      modalRows.push(renderBoxRow("", modalWidth, GRUVBOX.orange, bg));
+    }
+    modalRows.push(
+      renderBoxRow(
+        `${bg} ${GRUVBOX.aqua}${BOLD}▸ ${sec.heading}${RESET}`,
+        modalWidth,
+        GRUVBOX.orange,
+        bg,
+      ),
+    );
+    for (const [k, desc] of sec.rows) {
+      const keyCol = fitAnsiColumns(`${bg}   ${GRUVBOX.yellow}${BOLD}${k}${RESET}`, 20, {
+        pad: true,
+        padBg: bg,
+      });
+      const descCol = `${bg}${GRUVBOX.fg1}${desc}${RESET}`;
+      modalRows.push(
+        renderBoxRow(
+          fitAnsiColumns(`${keyCol} ${descCol}`, innerWidth, { pad: true, padBg: bg }),
+          modalWidth,
+          GRUVBOX.orange,
+          bg,
+        ),
+      );
+    }
+  }
+
+  modalRows.push(renderBoxBottom(modalWidth, GRUVBOX.orange, bg));
+
+  const trimmedModal = modalRows.slice(0, height);
+  const topPad = Math.max(0, Math.floor((height - trimmedModal.length) / 2));
+
+  const out: string[] = [];
+  const blankFull = `${GRUVBOX.bg0Hard}${" ".repeat(cols)}${RESET}`;
+  const leftMargin = `${GRUVBOX.bg0Hard}${" ".repeat(padLeft)}${RESET}`;
+  const rightMargin = `${GRUVBOX.bg0Hard}${" ".repeat(padRight)}${RESET}`;
+
+  for (let r = 0; r < height; r++) {
+    const mIdx = r - topPad;
+    if (mIdx >= 0 && mIdx < trimmedModal.length) {
+      out.push(`${leftMargin}${trimmedModal[mIdx]!}${rightMargin}`);
+    } else {
+      out.push(blankFull);
+    }
+  }
+
+  return out;
+}
+
+function renderFooterBar(state: RenderState, cols: number): string {
   let hints: Array<[string, string]>;
 
-  if (state.focusMode === "reply") {
+  if (state.showHelp) {
     hints = [
-      ["Enter", "Send Prompt"],
-      ["Ctrl+U", "Clear"],
-      ["Esc", "Cancel"],
+      ["? / Esc", "返回面板"],
     ];
-  } else if (state.focusMode === "interact") {
+  } else if (state.focusMode === "reply") {
     hints = [
-      ["↑/↓/Enter/y/n/1-9", "Forward to Agent"],
-      ["Ctrl+E", "Send Esc to Agent"],
-      ["Esc / Tab", "Back to List"],
+      ["Enter", "发送"],
+      ["Ctrl+U", "清空"],
+      ["Esc", "取消"],
     ];
   } else {
     hints = [
-      ["j/k", "Select"],
-      ["Enter", "Dive In"],
-      ["r /", "Inline Reply"],
-      ["Tab", "Control Right Pane"],
-      ["y/n/1-4", "Approve"],
-      ["m", selected?.group === "review" ? "Mark Reviewed" : "Seen"],
-      ["[/]", "Scroll Preview"],
-      ["z", state.showIdle ? "Hide Idle" : "Show Idle"],
-      ["q/Esc", "Close"],
+      ["j/k", "切换"],
+      ["Enter", "进入终端"],
+      ["r", "回复"],
+      ["y/n", "审批"],
+      ["m", "已阅"],
+      ["?", "全部快捷键"],
     ];
   }
 

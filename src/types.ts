@@ -134,6 +134,8 @@ export interface DeckAgentItem {
   workspaceLabel: string;
   workspaceNumber: number;
   tabLabel: string;
+  paneLabel?: string | null;
+  primaryTitle: string;
   branch?: string | null;
   cwd?: string | null;
   agentKind: string;

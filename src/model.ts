@@ -185,7 +185,19 @@ function isOptionNoise(line: string): boolean {
 function isPromptChrome(line: string): boolean {
   if (line.length <= 2) return true;
   if (/^(❯|>|\$|%\s*)$/.test(line)) return true;
-  if (/^(esc to interrupt|esc to cancel|ctrl\+[a-z] to|shift\+tab|\? for shortcuts|context left)/i.test(line)) {
+  if (
+    /^(tip:|esc to interrupt|esc to cancel|ctrl\+[a-z] to|shift\+tab|\? for shortcuts|context left|press shift\+tab|type your message)/i.test(
+      line,
+    )
+  ) {
+    return true;
+  }
+  // Agent CLI model/mode footer lines (e.g. "esc to cancel Gemini 4 Carbon · high", "Claude Opus · auto")
+  if (
+    /\b(gemini|claude|codex|gpt-\d|o[134]-|sonnet|opus|haiku)\b.*\b(high|medium|low|auto|fast|default|thinking)\b/i.test(
+      line,
+    )
+  ) {
     return true;
   }
   // Starship / Powerlevel10k prompt lines with git/node versions and clock
@@ -193,6 +205,43 @@ function isPromptChrome(line: string): boolean {
     return true;
   }
   return false;
+}
+
+export function resolvePrimaryTitle(
+  agent: Pick<AgentInfo, "name" | "display_agent" | "agent">,
+  pane: Pick<PaneInfo, "label"> | undefined,
+  workspaceLabel: string,
+  cwd?: string | null,
+): string {
+  const paneLabel = pane?.label?.trim();
+  if (paneLabel && !/^\d+$/.test(paneLabel)) {
+    return paneLabel;
+  }
+
+  const agentName = agent.name?.trim();
+  if (agentName) {
+    return agentName;
+  }
+
+  const baseDir = extractDirBasename(cwd);
+  if (baseDir && baseDir !== workspaceLabel && !isGenericDirName(baseDir)) {
+    return baseDir;
+  }
+
+  return workspaceLabel;
+}
+
+function extractDirBasename(cwd?: string | null): string | null {
+  if (!cwd) return null;
+  const trimmed = cwd.replace(/\/+$/, "");
+  if (!trimmed) return null;
+  const idx = trimmed.lastIndexOf("/");
+  return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
+}
+
+function isGenericDirName(dir: string): boolean {
+  const lower = dir.toLowerCase();
+  return lower === "work" || lower === "personal" || lower === "workspace" || lower === "projects" || lower === "src";
 }
 
 function cleanSingleLine(input: string): string {
@@ -243,14 +292,19 @@ export function buildDeckAgentItems(
 
     const branch = ws?.worktree?.branch ?? ws?.tokens?.branch ?? null;
     const cwd = agent.foreground_cwd ?? agent.cwd ?? pane?.foreground_cwd ?? pane?.cwd ?? null;
+    const workspaceLabel = ws?.label ?? agent.workspace_id;
+    const paneLabel = pane?.label?.trim() || null;
+    const primaryTitle = resolvePrimaryTitle(agent, pane, workspaceLabel, cwd);
 
     items.push({
       paneId: agent.pane_id,
       workspaceId: agent.workspace_id,
       tabId: agent.tab_id,
-      workspaceLabel: ws?.label ?? agent.workspace_id,
+      workspaceLabel,
       workspaceNumber: ws?.number ?? 999,
       tabLabel: tab?.label ?? agent.tab_id,
+      paneLabel,
+      primaryTitle,
       branch,
       cwd,
       agentKind,

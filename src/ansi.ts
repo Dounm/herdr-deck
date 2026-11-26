@@ -30,6 +30,7 @@ export const GRUVBOX = {
   green: fgHex(184, 187, 38), // #b8bb26 done / ready for review
   aqua: fgHex(142, 192, 124), // #8ec07c branch / path
   blue: fgHex(131, 165, 152), // #83a598 info / workspace
+  purple: fgHex(211, 134, 155), // #d3869b accent name color
 
   // Backgrounds
   bg0Hard: bgHex(29, 32, 33), // #1d2021
@@ -37,8 +38,96 @@ export const GRUVBOX = {
   bg1: bgHex(60, 56, 54), // #3c3836 selected row / header bar
   bg2: bgHex(80, 73, 69), // #504945 active badge / input bar
   bgUrgent: bgHex(76, 36, 32), // subtle warm dark red tint for selected blocked row
-  bgInteract: bgHex(52, 62, 54), // subtle greenish tint when interact mode active
+  bgModal: bgHex(34, 34, 34), // #222222 overlay modal card surface
 } as const;
+
+const NAME_PALETTE = [
+  GRUVBOX.blue,
+  GRUVBOX.aqua,
+  GRUVBOX.purple,
+  GRUVBOX.yellow,
+  GRUVBOX.green,
+  GRUVBOX.orange,
+] as const;
+
+/**
+ * Deterministic FNV-1a hash mapping an agent/pane title to a readable Gruvbox accent color.
+ */
+export function pickNameColor(name: string): string {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized) return GRUVBOX.fg1;
+  let hash = 2166136261;
+  for (let i = 0; i < normalized.length; i++) {
+    hash ^= normalized.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const idx = (hash >>> 0) % NAME_PALETTE.length;
+  return NAME_PALETTE[idx]!;
+}
+
+/**
+ * Render a rounded box top border: `╭─ Title ───────── RightTag ─╮` with exact visible width.
+ */
+export function renderBoxTop(
+  title: string,
+  rightTag: string,
+  width: number,
+  borderColor: string,
+  bg = "",
+): string {
+  if (width < 4) {
+    return fitAnsiColumns("╭" + "─".repeat(Math.max(0, width - 2)) + "╮", width);
+  }
+  const innerBudget = width - 2; // exclude ╭ and ╮
+  const leftText = title ? `─ ${title} ` : "";
+  const rightText = rightTag ? ` ${rightTag} ─` : "";
+
+  const leftW = visibleWidth(leftText);
+  const rightW = visibleWidth(rightText);
+
+  if (rightTag && leftW + rightW + 1 <= innerBudget) {
+    const fillCount = innerBudget - leftW - rightW;
+    const fill = `${bg}${borderColor}${"─".repeat(fillCount)}${RESET}`;
+    return (
+      `${bg}${borderColor}╭─${RESET}` +
+      (title ? `${bg} ${title}${RESET}${bg} ` : "") +
+      fill +
+      `${bg} ${rightTag}${RESET}${bg}${borderColor} ─╮${RESET}`
+    );
+  }
+
+  if (title) {
+    const maxTitleCols = Math.max(1, innerBudget - 4);
+    const fittedTitle = fitAnsiColumns(title, maxTitleCols, { ellipsis: "…" });
+    const usedTitleW = visibleWidth(fittedTitle);
+    const fillCount = Math.max(0, innerBudget - usedTitleW - 3);
+    return (
+      `${bg}${borderColor}╭─${RESET}` +
+      `${bg} ${fittedTitle}${RESET}${bg} ` +
+      `${bg}${borderColor}${"─".repeat(fillCount)}╮${RESET}`
+    );
+  }
+
+  return `${bg}${borderColor}╭${"─".repeat(innerBudget)}╮${RESET}`;
+}
+
+export function renderBoxBottom(width: number, borderColor: string, bg = ""): string {
+  if (width < 2) return "";
+  return `${bg}${borderColor}╰${"─".repeat(width - 2)}╯${RESET}`;
+}
+
+export function renderBoxRow(
+  innerContent: string,
+  width: number,
+  borderColor: string,
+  padBg?: string,
+): string {
+  if (width < 2) return "";
+  const innerWidth = width - 2;
+  const fitted = fitAnsiColumns(innerContent, innerWidth, { pad: true, padBg });
+  const bg = padBg ?? "";
+  return `${bg}${borderColor}│${RESET}${fitted}${bg}${borderColor}│${RESET}`;
+}
 
 export function style(text: string, ...codes: string[]): string {
   if (!codes.length) return text;
@@ -76,9 +165,10 @@ export function codePointWidth(cp: number): number {
     (cp <= 0x115f ||
       cp === 0x2329 ||
       cp === 0x232a ||
-      cp === 0x23f3 || // ⏳
-      cp === 0x26a1 || // ⚡
-      cp === 0x26a0 || // ⚠
+      (cp >= 0x23e9 && cp <= 0x23fa) || // ⏩..⏺ incl. ⏳ ⏰
+      (cp >= 0x25fd && cp <= 0x25fe) || // ◽◾
+      (cp >= 0x2600 && cp <= 0x27bf) || // Misc symbols & Dingbats (⚠ ⚡ ✅ ❌ ✨ etc.)
+      (cp >= 0x2b50 && cp <= 0x2b55) || // ⭐ ⭕
       (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
       (cp >= 0xac00 && cp <= 0xd7a3) ||
       (cp >= 0xf900 && cp <= 0xfaff) ||
@@ -205,4 +295,73 @@ export function fitAnsiColumns(
   }
 
   return out;
+}
+
+/**
+ * Slice a plain text input draft with a cursor index (in Unicode code points) so it fits within `maxCols`
+ * while keeping the cursor always visible. Returns the visible text slice and the cursor's cell offset inside it.
+ */
+export function layoutEditableInput(
+  text: string,
+  cursorIndex: number,
+  maxCols: number,
+): { visibleText: string; cursorCellOffset: number } {
+  const chars = Array.from(text);
+  const clampedCursor = Math.max(0, Math.min(chars.length, cursorIndex));
+  const widths = chars.map((ch) => codePointWidth(ch.codePointAt(0) ?? 0));
+
+  if (maxCols <= 1) {
+    return { visibleText: "", cursorCellOffset: 0 };
+  }
+
+  // Reserve 1 cell for the terminal cursor itself when at the end of the text
+  const textBudget = Math.max(1, maxCols - 1);
+
+  const totalWidth = widths.reduce((sum, w) => sum + w, 0);
+  if (totalWidth <= textBudget) {
+    let offset = 0;
+    for (let i = 0; i < clampedCursor; i++) {
+      offset += widths[i]!;
+    }
+    return { visibleText: text, cursorCellOffset: offset };
+  }
+
+  // Keep cursor visible by choosing a window [start, end) that contains clampedCursor
+  let start = 0;
+  let widthBeforeCursor = 0;
+  for (let i = 0; i < clampedCursor; i++) {
+    widthBeforeCursor += widths[i]!;
+  }
+
+  // If text before cursor exceeds budget, advance start until it fits (leave 1 cell for leading '‹')
+  if (widthBeforeCursor > textBudget - 1) {
+    let acc = 0;
+    let s = clampedCursor;
+    while (s > 0 && acc + widths[s - 1]! <= textBudget - 1) {
+      s -= 1;
+      acc += widths[s]!;
+    }
+    start = s;
+  }
+
+  const hasLeftOverflow = start > 0;
+  let used = hasLeftOverflow ? 1 : 0;
+  let end = start;
+  let cursorCellOffset = used;
+
+  while (end < chars.length) {
+    const w = widths[end]!;
+    if (used + w > textBudget) break;
+    if (end < clampedCursor) {
+      cursorCellOffset += w;
+    }
+    used += w;
+    end += 1;
+  }
+
+  const slice = chars.slice(start, end).join("");
+  return {
+    visibleText: hasLeftOverflow ? `‹${slice}` : slice,
+    cursorCellOffset,
+  };
 }

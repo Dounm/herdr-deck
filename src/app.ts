@@ -1,4 +1,4 @@
-import { parseTerminalInput, toHerdrKeySpec, type ParsedKey } from "./keys.ts";
+import { parseTerminalInput, type ParsedKey } from "./keys.ts";
 import { buildDeckAgentItems } from "./model.ts";
 import { getVisibleItems, renderScreen, type FilterTab, type RenderState, type UiFocusMode } from "./render.ts";
 import { HerdrRpcError, HerdrSocketClient } from "./socket-client.ts";
@@ -26,14 +26,34 @@ const GLOBAL_SUBSCRIPTIONS = [
   { type: "pane.agent_detected" },
 ];
 
+function readOriginFocusedPaneId(): string | null {
+  const rawCtx = process.env.HERDR_PLUGIN_CONTEXT_JSON;
+  if (rawCtx) {
+    try {
+      const ctx = JSON.parse(rawCtx) as Record<string, unknown>;
+      if (typeof ctx.focused_pane_id === "string" && ctx.focused_pane_id) {
+        return ctx.focused_pane_id;
+      }
+      if (typeof ctx.pane_id === "string" && ctx.pane_id) {
+        return ctx.pane_id;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return process.env.HERDR_PANE_ID ?? null;
+}
+
 export async function runTuiApp(): Promise<void> {
   const client = new HerdrSocketClient();
   const selfPaneId = process.env.HERDR_PANE_ID ?? null;
+  let originFocusedPaneId: string | null = readOriginFocusedPaneId();
 
   let persisted: PersistedDeckState = loadDeckState();
 
   let snapshot: SessionSnapshot | null = null;
   const snippetsByPane = new Map<string, string>();
+  const previewCache = new Map<string, string>();
   const lastFetchedRevision = new Map<string, number>();
 
   let items: DeckAgentItem[] = [];
@@ -41,10 +61,10 @@ export async function runTuiApp(): Promise<void> {
   let focusMode: UiFocusMode = "list";
   let filterTab: FilterTab = "all";
   let showIdle = true;
+  let showHelp = false;
   let previewText = "";
-  let previewPaneId: string | null = null;
-  let previewScrollOffset = 0;
   let replyDraft = "";
+  let replyCursor = 0;
   let toastMessage: string | null = null;
   let toastKind: "info" | "ok" | "warn" | "error" = "info";
   let toastTimer: NodeJS.Timeout | null = null;
@@ -52,12 +72,15 @@ export async function runTuiApp(): Promise<void> {
 
   let exiting = false;
   let renderScheduled = false;
+  let lastRenderedFrame = "";
   let refreshInFlight = false;
   let refreshQueued = false;
+  let previewRequestSeq = 0;
+  let previewDebounceTimer: NodeJS.Timeout | null = null;
   let previewRefreshTimer: NodeJS.Timeout | null = null;
   let subHandle: { close: () => void } | null = null;
 
-  const setToast = (msg: string, kind: "info" | "ok" | "warn" | "error" = "info", durationMs = 3200) => {
+  const setToast = (msg: string, kind: "info" | "ok" | "warn" | "error" = "info", durationMs = 3000) => {
     toastMessage = msg;
     toastKind = kind;
     if (toastTimer) clearTimeout(toastTimer);
@@ -68,95 +91,114 @@ export async function runTuiApp(): Promise<void> {
     scheduleRender();
   };
 
-  const getCurrentVisible = (): DeckAgentItem[] =>
-    getVisibleItems({
-      cols: process.stdout.columns || 100,
-      rows: process.stdout.rows || 30,
-      items,
-      selectedPaneId,
-      focusMode,
-      filterTab,
-      showIdle,
-      previewText,
-      previewScrollOffset,
-      replyDraft,
-      toastMessage,
-      toastKind,
-      spinnerTick,
-      nowMs: Date.now(),
-    });
+  const buildRenderState = (): RenderState => ({
+    cols: process.stdout.columns || 100,
+    rows: process.stdout.rows || 30,
+    items,
+    selectedPaneId,
+    focusMode,
+    filterTab,
+    showIdle,
+    showHelp,
+    previewText,
+    replyDraft,
+    replyCursor,
+    toastMessage,
+    toastKind,
+    spinnerTick,
+    nowMs: Date.now(),
+  });
+
+  const getCurrentVisible = (): DeckAgentItem[] => getVisibleItems(buildRenderState());
 
   const getSelectedItem = (): DeckAgentItem | null => {
     const vis = getCurrentVisible();
     return vis.find((x) => x.paneId === selectedPaneId) ?? vis[0] ?? null;
   };
 
-  const scheduleRender = () => {
+  const scheduleRender = (forceWrite = false) => {
     if (exiting || renderScheduled) return;
     renderScheduled = true;
     queueMicrotask(() => {
       renderScheduled = false;
       if (exiting) return;
-      const state: RenderState = {
-        cols: process.stdout.columns || 100,
-        rows: process.stdout.rows || 30,
-        items,
-        selectedPaneId,
-        focusMode,
-        filterTab,
-        showIdle,
-        previewText,
-        previewScrollOffset,
-        replyDraft,
-        toastMessage,
-        toastKind,
-        spinnerTick,
-        nowMs: Date.now(),
-      };
-      const frame = renderScreen(state);
+      const frame = renderScreen(buildRenderState());
+      if (!forceWrite && frame === lastRenderedFrame) {
+        return;
+      }
+      lastRenderedFrame = frame;
       process.stdout.write(frame);
     });
   };
 
-  const refreshSelectedPreview = async (force = false) => {
+  const fetchPreviewForPane = async (targetPaneId: string, seq: number) => {
+    try {
+      const readRes = await client.readPane(targetPaneId, {
+        source: "recent",
+        format: "ansi",
+        stripAnsi: false,
+        lines: 100,
+      });
+      if (exiting) return;
+
+      previewCache.set(targetPaneId, readRes.text);
+      snippetsByPane.set(targetPaneId, readRes.text);
+      lastFetchedRevision.set(targetPaneId, readRes.revision);
+
+      // Strict generation & selection guard: never let a stale response overwrite a newer selection
+      const currentSel = getSelectedItem();
+      if (seq !== previewRequestSeq || currentSel?.paneId !== targetPaneId) {
+        return;
+      }
+
+      const previewChanged = previewText !== readRes.text;
+      previewText = readRes.text;
+
+      if (snapshot) {
+        const nextItems = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
+        items = nextItems;
+      }
+      if (previewChanged) {
+        scheduleRender();
+      }
+    } catch {
+      // Ignore transient read error if pane just closed
+    }
+  };
+
+  const requestSelectedPreview = (debounceMs = 0) => {
+    if (previewDebounceTimer) {
+      clearTimeout(previewDebounceTimer);
+      previewDebounceTimer = null;
+    }
+
     const sel = getSelectedItem();
     if (!sel) {
-      previewPaneId = null;
+      previewRequestSeq += 1;
       previewText = "";
       scheduleRender();
       return;
     }
 
-    const paneChanged = previewPaneId !== sel.paneId;
-    if (paneChanged) {
-      previewScrollOffset = 0;
+    const seq = ++previewRequestSeq;
+    const targetPaneId = sel.paneId;
+
+    // Immediately show cached preview for this pane so rapid j/k navigation never flashes blank or old pane
+    const cached = previewCache.get(targetPaneId);
+    if (cached !== undefined) {
+      previewText = cached;
     }
 
-    try {
-      const readRes = await client.readPane(sel.paneId, {
-        source: "recent",
-        format: "ansi",
-        stripAnsi: false,
-        lines: 120,
-      });
-      if (exiting) return;
-      // Only apply if still selected (or cache snippet)
-      snippetsByPane.set(sel.paneId, readRes.text);
-      lastFetchedRevision.set(sel.paneId, readRes.revision);
-
-      const currentSel = getSelectedItem();
-      if (currentSel?.paneId === sel.paneId || force) {
-        previewPaneId = sel.paneId;
-        previewText = readRes.text;
-      }
-
-      if (snapshot) {
-        items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
-      }
-      scheduleRender();
-    } catch {
-      // Ignore transient read error if pane just closed
+    if (debounceMs <= 0) {
+      void fetchPreviewForPane(targetPaneId, seq);
+      return;
     }
+
+    previewDebounceTimer = setTimeout(() => {
+      previewDebounceTimer = null;
+      if (exiting || seq !== previewRequestSeq) return;
+      void fetchPreviewForPane(targetPaneId, seq);
+    }, debounceMs);
   };
 
   const refreshSnippetsForPriorityAgents = async (snap: SessionSnapshot) => {
@@ -198,6 +240,9 @@ export async function runTuiApp(): Promise<void> {
 
       const snap = await client.getSnapshot();
       snapshot = snap;
+      if (!originFocusedPaneId && snap.focused_pane_id) {
+        originFocusedPaneId = snap.focused_pane_id;
+      }
 
       const dirty = reconcileTimersWithSnapshot(persisted, snap);
       if (dirty) {
@@ -213,11 +258,16 @@ export async function runTuiApp(): Promise<void> {
         selectedPaneId = vis[0]?.paneId ?? null;
       }
 
+      const sel = getSelectedItem();
+      if (sel && previewCache.has(sel.paneId)) {
+        previewText = previewCache.get(sel.paneId)!;
+      }
+
       scheduleRender();
-      await refreshSelectedPreview();
+      requestSelectedPreview(0);
     } catch (err) {
       setToast(
-        `Unable to query Herdr: ${err instanceof Error ? err.message : String(err)}`,
+        `无法读取 Herdr 状态: ${err instanceof Error ? err.message : String(err)}`,
         "error",
       );
     } finally {
@@ -269,6 +319,7 @@ export async function runTuiApp(): Promise<void> {
     if (exiting) return;
     exiting = true;
     subHandle?.close();
+    if (previewDebounceTimer) clearTimeout(previewDebounceTimer);
     if (previewRefreshTimer) clearInterval(previewRefreshTimer);
     if (toastTimer) clearTimeout(toastTimer);
 
@@ -280,11 +331,22 @@ export async function runTuiApp(): Promise<void> {
       }
     }
     process.stdin.pause();
-    // Restore cursor + leave alternate screen buffer
-    process.stdout.write("\x1b[?25h\x1b[?1049l");
+    // Ensure synchronized output is off, re-enable line auto-wrap, reset cursor shape, restore cursor, and leave alternate screen
+    process.stdout.write("\x1b[?2026l\x1b[?7h\x1b[0 q\x1b[?25h\x1b[?1049l");
 
     await client.closePopup();
     process.exit(code);
+  };
+
+  const selectPaneById = (nextPaneId: string) => {
+    if (selectedPaneId === nextPaneId) return;
+    selectedPaneId = nextPaneId;
+    const cached = previewCache.get(nextPaneId);
+    if (cached !== undefined) {
+      previewText = cached;
+    }
+    scheduleRender();
+    requestSelectedPreview(55);
   };
 
   const moveSelection = (delta: number) => {
@@ -293,10 +355,7 @@ export async function runTuiApp(): Promise<void> {
     const idx = vis.findIndex((x) => x.paneId === selectedPaneId);
     const cur = idx === -1 ? 0 : idx;
     const nextIdx = (cur + delta + vis.length) % vis.length;
-    selectedPaneId = vis[nextIdx]!.paneId;
-    previewScrollOffset = 0;
-    scheduleRender();
-    void refreshSelectedPreview(true);
+    selectPaneById(vis[nextIdx]!.paneId);
   };
 
   const advanceToNextAttentionItem = (previousPaneId: string) => {
@@ -307,17 +366,14 @@ export async function runTuiApp(): Promise<void> {
         (x.group === "needs_you" || x.group === "review"),
     );
     if (nextUrgent) {
-      selectedPaneId = nextUrgent.paneId;
-      previewScrollOffset = 0;
-      void refreshSelectedPreview(true);
+      selectPaneById(nextUrgent.paneId);
     }
   };
 
   const diveIntoSelectedAgent = async () => {
     const sel = getSelectedItem();
-    if (!sel) return;
+    if (!sel || exiting) return;
 
-    // Mark seen in Deck state
     markAgentSeenInDeck(persisted, {
       pane_id: sel.paneId,
       agent_status: sel.rawStatus,
@@ -326,15 +382,29 @@ export async function runTuiApp(): Promise<void> {
     });
     saveDeckState(persisted);
 
-    // IMPORTANT: Focus target FIRST before closing popup!
-    // Sending popup.close kills this process immediately via SIGHUP, so any code after closePopup() never runs!
-    await client.focusWorkspace(sel.workspaceId);
-    try {
-      await client.focusAgent(sel.paneId);
-    } catch {
-      await client.focusPaneAcrossWorkspaces(sel.paneId, sel.workspaceId, sel.tabId);
+    const alreadyFocused =
+      sel.focusedInHerdr ||
+      (originFocusedPaneId !== null && sel.paneId === originFocusedPaneId);
+
+    // IMPORTANT: Focus target FIRST before closing popup (popup.close terminates us via SIGHUP).
+    // If target is already the focused underlying pane, skip redundant focus RPCs and close cleanly!
+    if (!alreadyFocused) {
+      try {
+        await client.focusWorkspace(sel.workspaceId);
+      } catch {
+        // continue to agent/pane focus fallback
+      }
+      try {
+        await client.focusAgent(sel.paneId);
+      } catch {
+        try {
+          await client.focusPaneAcrossWorkspaces(sel.paneId, sel.workspaceId, sel.tabId);
+        } catch {
+          // still close popup cleanly
+        }
+      }
     }
-    await client.closePopup();
+
     await cleanupAndExit(0);
   };
 
@@ -344,13 +414,9 @@ export async function runTuiApp(): Promise<void> {
     const wasUrgent = sel.group === "needs_you";
     try {
       await client.sendAgentKeys(sel.paneId, [herdrKey]);
-      setToast(
-        `Sent [${label ?? herdrKey}] → ${sel.workspaceLabel}/${sel.agentDisplayName}`,
-        "ok",
-        2000,
-      );
+      setToast(`已发送 [${label ?? herdrKey}] → ${sel.primaryTitle}`, "ok", 2000);
       setTimeout(() => {
-        void refreshSelectedPreview(true);
+        requestSelectedPreview(0);
         void refreshSnapshot(true).then(() => {
           if (wasUrgent && focusMode === "list") {
             const updated = items.find((x) => x.paneId === sel.paneId);
@@ -361,14 +427,13 @@ export async function runTuiApp(): Promise<void> {
         });
       }, 140);
     } catch (err) {
-      // Fallback to raw pane.send_keys if agent authority rejected
       try {
         await client.sendPaneKeys(sel.paneId, [herdrKey]);
-        setToast(`Sent [${label ?? herdrKey}] to pane ${sel.paneId}`, "ok", 2000);
-        setTimeout(() => void refreshSelectedPreview(true), 140);
+        setToast(`已发送 [${label ?? herdrKey}] → ${sel.primaryTitle}`, "ok", 2000);
+        setTimeout(() => requestSelectedPreview(0), 140);
       } catch (err2) {
         setToast(
-          `Key failed: ${err2 instanceof Error ? err2.message : String(err)}`,
+          `发送按键失败: ${err2 instanceof Error ? err2.message : String(err)}`,
           "error",
         );
       }
@@ -378,12 +443,7 @@ export async function runTuiApp(): Promise<void> {
   const submitInlineReply = async () => {
     const sel = getSelectedItem();
     const text = replyDraft.trim();
-    if (!sel) {
-      focusMode = "list";
-      scheduleRender();
-      return;
-    }
-    if (!text) {
+    if (!sel || !text) {
       focusMode = "list";
       scheduleRender();
       return;
@@ -392,6 +452,7 @@ export async function runTuiApp(): Promise<void> {
     try {
       await client.sendAgentPrompt(sel.paneId, text);
       replyDraft = "";
+      replyCursor = 0;
       focusMode = "list";
       markAgentSeenInDeck(persisted, {
         pane_id: sel.paneId,
@@ -400,32 +461,61 @@ export async function runTuiApp(): Promise<void> {
         revision: sel.revision,
       });
       saveDeckState(persisted);
-      setToast(`Prompt sent → ${sel.workspaceLabel}/${sel.agentDisplayName}`, "ok");
+      setToast(`已发送回复 → ${sel.primaryTitle}`, "ok");
       setTimeout(() => {
         void refreshSnapshot(true);
-        void refreshSelectedPreview(true);
       }, 180);
     } catch (err) {
       if (err instanceof HerdrRpcError && err.code === "agent_blocked") {
         setToast(
-          "Agent is blocked on an approval dialog! Approve with [y/n/1-4] or [Tab] first.",
+          "该 Agent 正卡在审批弹窗，请先用 [y/n/1-4] 审批或按 [Enter] 进入终端处理",
           "warn",
-          4500,
+          4200,
         );
         focusMode = "list";
         scheduleRender();
         return;
       }
       setToast(
-        `Prompt failed: ${err instanceof Error ? err.message : String(err)}`,
+        `发送失败: ${err instanceof Error ? err.message : String(err)}`,
         "error",
       );
     }
   };
 
+  const markSelectedReviewed = () => {
+    const sel = getSelectedItem();
+    if (!sel) return;
+    markAgentSeenInDeck(persisted, {
+      pane_id: sel.paneId,
+      agent_status: sel.rawStatus,
+      completion_seq: sel.completionSeq,
+      revision: sel.revision,
+    });
+    saveDeckState(persisted);
+    if (snapshot) {
+      items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
+    }
+    setToast(`已将 ${sel.primaryTitle} 标记为已审阅`, "ok", 1800);
+    advanceToNextAttentionItem(sel.paneId);
+    scheduleRender();
+  };
+
   const handleListModeKey = async (key: ParsedKey) => {
     if (key.kind === "ctrl" && key.key === "c") {
       await cleanupAndExit(0);
+      return;
+    }
+
+    // Help overlay intercepts navigation cleanly
+    if (showHelp) {
+      if (
+        (key.kind === "special" && (key.name === "esc" || key.name === "enter" || key.name === "space")) ||
+        (key.kind === "char" && (key.value === "?" || key.value === "q"))
+      ) {
+        showHelp = false;
+        scheduleRender();
+      }
       return;
     }
 
@@ -443,22 +533,7 @@ export async function runTuiApp(): Promise<void> {
         case "enter":
           await diveIntoSelectedAgent();
           return;
-        case "tab":
-          if (getSelectedItem()) {
-            focusMode = "interact";
-            setToast("Live Key Passthrough active — keys go directly to right-side agent (Esc/Tab to exit)", "info", 2800);
-          }
-          return;
-        case "pageup":
-          previewScrollOffset += 10;
-          scheduleRender();
-          return;
-        case "pagedown":
-          previewScrollOffset = Math.max(0, previewScrollOffset - 10);
-          scheduleRender();
-          return;
         case "space":
-          // Toggle mark reviewed
           markSelectedReviewed();
           return;
         default:
@@ -475,25 +550,19 @@ export async function runTuiApp(): Promise<void> {
         moveSelection(-1);
         return;
       }
-      if (key.key === "u") {
-        previewScrollOffset += 10;
-        scheduleRender();
-        return;
-      }
-      if (key.key === "d") {
-        previewScrollOffset = Math.max(0, previewScrollOffset - 10);
-        scheduleRender();
-        return;
-      }
       if (key.key === "r") {
         await refreshSnapshot(true);
-        setToast("Refreshed snapshot", "info", 1400);
+        setToast("已刷新全部 Agent 状态", "info", 1400);
         return;
       }
     }
 
     if (key.kind === "char") {
       switch (key.value) {
+        case "?":
+          showHelp = true;
+          scheduleRender();
+          return;
         case "q":
           await cleanupAndExit(0);
           return;
@@ -506,20 +575,14 @@ export async function runTuiApp(): Promise<void> {
         case "g": {
           const vis = getCurrentVisible();
           if (vis[0]) {
-            selectedPaneId = vis[0].paneId;
-            previewScrollOffset = 0;
-            scheduleRender();
-            void refreshSelectedPreview(true);
+            selectPaneById(vis[0].paneId);
           }
           return;
         }
         case "G": {
           const vis = getCurrentVisible();
           if (vis.length > 0) {
-            selectedPaneId = vis[vis.length - 1]!.paneId;
-            previewScrollOffset = 0;
-            scheduleRender();
-            void refreshSelectedPreview(true);
+            selectPaneById(vis[vis.length - 1]!.paneId);
           }
           return;
         }
@@ -527,13 +590,8 @@ export async function runTuiApp(): Promise<void> {
         case "/":
           if (getSelectedItem()) {
             focusMode = "reply";
+            replyCursor = Array.from(replyDraft).length;
             scheduleRender();
-          }
-          return;
-        case "i":
-          if (getSelectedItem()) {
-            focusMode = "interact";
-            setToast("Live Key Passthrough active (Esc/Tab to exit)", "info", 2400);
           }
           return;
         case "m":
@@ -550,7 +608,7 @@ export async function runTuiApp(): Promise<void> {
             const vis = getCurrentVisible();
             if (!vis.some((x) => x.paneId === selectedPaneId)) {
               selectedPaneId = vis[0]?.paneId ?? null;
-              void refreshSelectedPreview(true);
+              requestSelectedPreview(0);
             }
           }
           scheduleRender();
@@ -561,17 +619,9 @@ export async function runTuiApp(): Promise<void> {
             const vis = getCurrentVisible();
             if (!vis.some((x) => x.paneId === selectedPaneId)) {
               selectedPaneId = vis[0]?.paneId ?? null;
-              void refreshSelectedPreview(true);
+              requestSelectedPreview(0);
             }
           }
-          scheduleRender();
-          return;
-        case "[":
-          previewScrollOffset += 6;
-          scheduleRender();
-          return;
-        case "]":
-          previewScrollOffset = Math.max(0, previewScrollOffset - 6);
           scheduleRender();
           return;
         case "y":
@@ -588,21 +638,13 @@ export async function runTuiApp(): Promise<void> {
           if (sel.group === "needs_you") {
             await quickSendKeyToSelected(key.value, key.value);
           } else if (/^[1-4]$/.test(key.value)) {
-            // Jump to Nth visible item when not on a blocked agent
             const vis = getCurrentVisible();
             const idx = Number(key.value) - 1;
             if (vis[idx]) {
-              selectedPaneId = vis[idx].paneId;
-              previewScrollOffset = 0;
-              scheduleRender();
-              void refreshSelectedPreview(true);
+              selectPaneById(vis[idx].paneId);
             }
           } else {
-            setToast(
-              `Selected agent isn't blocked. Press [Tab] for live keys or [r] to reply.`,
-              "info",
-              2400,
-            );
+            setToast("当前 Agent 未处于阻塞审批态，按 [r] 回复或 [Enter] 进入终端", "info", 2400);
           }
           return;
         }
@@ -612,48 +654,10 @@ export async function runTuiApp(): Promise<void> {
     }
   };
 
-  const markSelectedReviewed = () => {
-    const sel = getSelectedItem();
-    if (!sel) return;
-    markAgentSeenInDeck(persisted, {
-      pane_id: sel.paneId,
-      agent_status: sel.rawStatus,
-      completion_seq: sel.completionSeq,
-      revision: sel.revision,
-    });
-    saveDeckState(persisted);
-    if (snapshot) {
-      items = buildDeckAgentItems(snapshot, persisted, snippetsByPane, selfPaneId);
-    }
-    setToast(`Marked ${sel.workspaceLabel}/${sel.agentDisplayName} reviewed`, "ok", 1800);
-    advanceToNextAttentionItem(sel.paneId);
-    scheduleRender();
-  };
-
-  const handleInteractModeKey = async (key: ParsedKey) => {
-    if (key.kind === "ctrl" && key.key === "c") {
-      focusMode = "list";
-      scheduleRender();
-      return;
-    }
-    if (key.kind === "special" && (key.name === "esc" || key.name === "tab")) {
-      focusMode = "list";
-      setToast("Returned to Agent List", "info", 1400);
-      return;
-    }
-    // Ctrl+E sends literal Escape into the agent dialog while staying in interact mode
-    if (key.kind === "ctrl" && key.key === "e") {
-      await quickSendKeyToSelected("esc", "Esc");
-      return;
-    }
-
-    const spec = toHerdrKeySpec(key);
-    if (spec) {
-      await quickSendKeyToSelected(spec);
-    }
-  };
-
   const handleReplyModeKey = async (key: ParsedKey) => {
+    const chars = Array.from(replyDraft);
+    const pos = Math.max(0, Math.min(chars.length, replyCursor));
+
     if (key.kind === "special") {
       if (key.name === "esc") {
         focusMode = "list";
@@ -664,15 +668,47 @@ export async function runTuiApp(): Promise<void> {
         await submitInlineReply();
         return;
       }
-      if (key.name === "backspace") {
-        const chars = Array.from(replyDraft);
-        chars.pop();
-        replyDraft = chars.join("");
+      if (key.name === "left") {
+        replyCursor = Math.max(0, pos - 1);
         scheduleRender();
         return;
       }
+      if (key.name === "right") {
+        replyCursor = Math.min(chars.length, pos + 1);
+        scheduleRender();
+        return;
+      }
+      if (key.name === "home") {
+        replyCursor = 0;
+        scheduleRender();
+        return;
+      }
+      if (key.name === "end") {
+        replyCursor = chars.length;
+        scheduleRender();
+        return;
+      }
+      if (key.name === "backspace") {
+        if (pos > 0) {
+          chars.splice(pos - 1, 1);
+          replyDraft = chars.join("");
+          replyCursor = pos - 1;
+          scheduleRender();
+        }
+        return;
+      }
+      if (key.name === "delete") {
+        if (pos < chars.length) {
+          chars.splice(pos, 1);
+          replyDraft = chars.join("");
+          scheduleRender();
+        }
+        return;
+      }
       if (key.name === "space") {
-        replyDraft += " ";
+        chars.splice(pos, 0, " ");
+        replyDraft = chars.join("");
+        replyCursor = pos + 1;
         scheduleRender();
         return;
       }
@@ -685,13 +721,28 @@ export async function runTuiApp(): Promise<void> {
         scheduleRender();
         return;
       }
+      if (key.key === "a") {
+        replyCursor = 0;
+        scheduleRender();
+        return;
+      }
+      if (key.key === "e") {
+        replyCursor = chars.length;
+        scheduleRender();
+        return;
+      }
       if (key.key === "u") {
-        replyDraft = "";
+        replyDraft = chars.slice(pos).join("");
+        replyCursor = 0;
         scheduleRender();
         return;
       }
       if (key.key === "w") {
-        replyDraft = replyDraft.replace(/\S+\s*$/, "");
+        const before = chars.slice(0, pos).join("");
+        const after = chars.slice(pos).join("");
+        const trimmedBefore = before.replace(/\S+\s*$/, "");
+        replyDraft = trimmedBefore + after;
+        replyCursor = Array.from(trimmedBefore).length;
         scheduleRender();
         return;
       }
@@ -699,7 +750,9 @@ export async function runTuiApp(): Promise<void> {
     }
 
     if (key.kind === "char") {
-      replyDraft += key.value;
+      chars.splice(pos, 0, key.value);
+      replyDraft = chars.join("");
+      replyCursor = pos + 1;
       scheduleRender();
     }
   };
@@ -715,21 +768,25 @@ export async function runTuiApp(): Promise<void> {
   process.stdin.on("data", (buf: Buffer) => {
     const keys = parseTerminalInput(buf);
     void (async () => {
-      for (const k of keys) {
-        if (exiting) break;
-        if (focusMode === "reply") {
-          await handleReplyModeKey(k);
-        } else if (focusMode === "interact") {
-          await handleInteractModeKey(k);
-        } else {
-          await handleListModeKey(k);
+      try {
+        for (const k of keys) {
+          if (exiting) break;
+          if (focusMode === "reply") {
+            await handleReplyModeKey(k);
+          } else {
+            await handleListModeKey(k);
+          }
+        }
+      } catch (err) {
+        if (!exiting) {
+          setToast(`操作异常: ${err instanceof Error ? err.message : String(err)}`, "error");
         }
       }
     })();
   });
 
   process.stdout.on("resize", () => {
-    scheduleRender();
+    scheduleRender(true);
   });
 
   process.on("SIGINT", () => void cleanupAndExit(0));
@@ -742,25 +799,32 @@ export async function runTuiApp(): Promise<void> {
 
   let knownSubSet = initialAgentPaneIds.join(",");
 
-  // 1-second heartbeat for live working/blocked timers, spinner animation, and active preview polling
+  // Heartbeat for live timers & active preview polling (skip redundant redraws when everything is static)
   previewRefreshTimer = setInterval(() => {
     if (exiting) return;
-    spinnerTick = (spinnerTick + 1) % 10;
 
-    // Resubscribe if live agent pane list changed
     const currentSet = items.map((x) => x.paneId).join(",");
     if (currentSet !== knownSubSet) {
       knownSubSet = currentSet;
       startSubscriptions(items.map((x) => x.paneId));
     }
 
+    const hasActiveTimers = items.some(
+      (x) => x.group === "working" || x.group === "needs_you" || x.group === "review",
+    );
     const sel = getSelectedItem();
-    if (
-      sel &&
-      (sel.group === "working" || sel.group === "needs_you" || focusMode === "interact")
-    ) {
-      void refreshSelectedPreview();
-    } else {
+    const shouldPollPreview =
+      !showHelp &&
+      sel !== null &&
+      (sel.group === "working" || sel.group === "needs_you");
+
+    if (hasActiveTimers) {
+      spinnerTick = (spinnerTick + 1) % 10;
+    }
+
+    if (shouldPollPreview) {
+      requestSelectedPreview(0);
+    } else if (hasActiveTimers && !showHelp) {
       scheduleRender();
     }
   }, 900);
