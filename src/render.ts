@@ -1,8 +1,6 @@
 import {
   BOLD,
-  DIM,
   fitAnsiColumns,
-  GRUVBOX,
   layoutEditableInput,
   pickNameColor,
   renderBoxBottom,
@@ -14,6 +12,7 @@ import {
   wrapAnsiLine,
 } from "./ansi.ts";
 import { formatDurationCompact, formatRelativeAge } from "./state.ts";
+import { DEFAULT_THEME, type DeckTheme } from "./theme.ts";
 import type { AttentionGroup, DeckAgentItem, GitRepoInfo } from "./types.ts";
 
 export type UiFocusMode = "list" | "reply" | "rename";
@@ -37,19 +36,26 @@ export interface RenderState {
   toastKind: "info" | "ok" | "warn" | "error";
   spinnerTick: number;
   nowMs: number;
+  theme?: DeckTheme;
 }
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const GROUP_META: Record<
-  AttentionGroup,
-  { title: string; color: string; badge: string }
-> = {
-  needs_you: { title: "NEEDS YOU", color: GRUVBOX.red, badge: "!" },
-  review: { title: "READY FOR REVIEW", color: GRUVBOX.green, badge: "✓" },
-  working: { title: "WORKING", color: GRUVBOX.yellow, badge: "↻" },
-  idle: { title: "IDLE", color: GRUVBOX.gray, badge: "○" },
-};
+function getGroupMeta(
+  group: AttentionGroup,
+  theme: DeckTheme,
+): { title: string; color: string; badge: string } {
+  switch (group) {
+    case "needs_you":
+      return { title: "NEEDS YOU", color: theme.statusUrgent, badge: "!" };
+    case "review":
+      return { title: "READY FOR REVIEW", color: theme.statusReview, badge: "✓" };
+    case "working":
+      return { title: "WORKING", color: theme.statusWorking, badge: "↻" };
+    case "idle":
+      return { title: "IDLE", color: theme.statusIdle, badge: "○" };
+  }
+}
 
 export function getVisibleItems(state: RenderState): DeckAgentItem[] {
   return state.items.filter((item) => {
@@ -70,6 +76,7 @@ export function getVisibleItems(state: RenderState): DeckAgentItem[] {
 export function renderScreen(state: RenderState): string {
   const cols = Math.max(44, state.cols);
   const rows = Math.max(14, state.rows);
+  const theme = state.theme ?? DEFAULT_THEME;
 
   const visibleItems = getVisibleItems(state);
   const selectedItem =
@@ -80,14 +87,14 @@ export function renderScreen(state: RenderState): string {
   const lines: string[] = [];
 
   // 1. Top Header Bar (1 row)
-  lines.push(renderTopBar(state, cols));
+  lines.push(renderTopBar(state, cols, theme));
 
   // 2. Main Body (rows - 2 rows: top bar + footer bar)
   const bodyRows = Math.max(8, rows - 2);
   let hardwareCursor: { row: number; col: number } | null = null;
 
   if (state.showHelp) {
-    lines.push(...renderCheatsheetBody(cols, bodyRows));
+    lines.push(...renderCheatsheetBody(cols, bodyRows, theme));
   } else {
     const stacked = cols < 82;
     if (stacked) {
@@ -99,8 +106,17 @@ export function renderScreen(state: RenderState): string {
         selectedItem?.itemKey ?? null,
         cols,
         topRows,
+        theme,
       );
-      const rightCol = renderRightColumn(state, selectedItem, cols, bottomRows, 1, 1 + topRows);
+      const rightCol = renderRightColumn(
+        state,
+        selectedItem,
+        cols,
+        bottomRows,
+        1,
+        1 + topRows,
+        theme,
+      );
       hardwareCursor = rightCol.cursor;
       lines.push(...leftLines, ...rightCol.lines);
     } else {
@@ -112,6 +128,7 @@ export function renderScreen(state: RenderState): string {
         selectedItem?.itemKey ?? null,
         leftWidth,
         bodyRows,
+        theme,
       );
       const rightCol = renderRightColumn(
         state,
@@ -120,6 +137,7 @@ export function renderScreen(state: RenderState): string {
         bodyRows,
         leftWidth + 1,
         2,
+        theme,
       );
       hardwareCursor = rightCol.cursor;
       for (let r = 0; r < bodyRows; r++) {
@@ -131,7 +149,7 @@ export function renderScreen(state: RenderState): string {
   }
 
   // 3. Compact Footer Bar (1 row)
-  lines.push(renderFooterBar(state, cols));
+  lines.push(renderFooterBar(state, cols, theme));
 
   // Wrap frame with DEC 2026 Synchronized Output (BSU/ESU) + disable line auto-wrap (DECAWM off)
   // + explicit 1-based row positioning (\x1b[r;1H) per line so an exotic wide glyph in the right
@@ -148,7 +166,7 @@ export function renderScreen(state: RenderState): string {
   return `\x1b[?2026h\x1b[?7l\x1b[?25l${body}${cursorSuffix}\x1b[?2026l`;
 }
 
-function renderTopBar(state: RenderState, cols: number): string {
+function renderTopBar(state: RenderState, cols: number, theme: DeckTheme): string {
   const counts = {
     needs_you: 0,
     review: 0,
@@ -159,26 +177,26 @@ function renderTopBar(state: RenderState, cols: number): string {
     counts[item.group] += 1;
   }
 
-  const brandLabel = `${GRUVBOX.bg2}${GRUVBOX.orange}${BOLD} ◈ HERDR DECK ${RESET}`;
+  const brandLabel = `${theme.bgBrand}${theme.fgBrand}${BOLD} ◈ HERDR DECK ${RESET}`;
 
   const badges: string[] = [];
   if (counts.needs_you > 0) {
-    badges.push(`${GRUVBOX.bgUrgent}${GRUVBOX.red}${BOLD} ! ${counts.needs_you} 待审批 ${RESET}`);
+    badges.push(`${theme.bgUrgent}${theme.fgUrgentBadge}${BOLD} ! ${counts.needs_you} 待审批 ${RESET}`);
   } else {
-    badges.push(`${GRUVBOX.bg1}${GRUVBOX.gray} · 0 阻塞 ${RESET}`);
+    badges.push(`${theme.bgPill}${theme.fgPillMuted} · 0 阻塞 ${RESET}`);
   }
 
   if (counts.review > 0) {
-    badges.push(`${GRUVBOX.bg1}${GRUVBOX.green}${BOLD} ✓ ${counts.review} 待审阅 ${RESET}`);
+    badges.push(`${theme.bgPill}${theme.fgPillReview}${BOLD} ✓ ${counts.review} 待审阅 ${RESET}`);
   }
 
   const spin = SPINNER_FRAMES[state.spinnerTick % SPINNER_FRAMES.length]!;
   if (counts.working > 0) {
-    badges.push(`${GRUVBOX.bg1}${GRUVBOX.yellow} ${spin} ${counts.working} 运行中 ${RESET}`);
+    badges.push(`${theme.bgPill}${theme.fgPillWorking} ${spin} ${counts.working} 运行中 ${RESET}`);
   }
 
   badges.push(
-    `${GRUVBOX.bg1}${GRUVBOX.gray} ○ ${counts.idle} 空闲${state.showIdle ? "" : " (隐藏)"} ${RESET}`,
+    `${theme.bgPill}${theme.fgPillMuted} ○ ${counts.idle} 空闲${state.showIdle ? "" : " (隐藏)"} ${RESET}`,
   );
 
   const filterTag =
@@ -188,18 +206,24 @@ function renderTopBar(state: RenderState, cols: number): string {
         ? "仅待办"
         : "活跃";
 
-  const leftPart = `${brandLabel} ${badges.join(" ")}`;
-  const rightPart = `${GRUVBOX.bg1}${GRUVBOX.fg3} [f] ${filterTag} ${RESET}`;
+  const barSep = theme.bgBar ? `${theme.bgBar} ${RESET}` : " ";
+  const leftPart = `${brandLabel}${barSep}${badges.join(barSep)}`;
+  const rightPart = `${theme.bgPill}${theme.fgPill} [f] ${filterTag} ${RESET}`;
 
   const leftW = visibleWidth(leftPart);
   const rightW = visibleWidth(rightPart);
 
   if (leftW + rightW + 1 <= cols) {
-    const gap = `${GRUVBOX.bg0Hard}${" ".repeat(cols - leftW - rightW)}${RESET}`;
+    const gapSpaces = " ".repeat(cols - leftW - rightW);
+    const gap = theme.bgBar ? `${theme.bgBar}${gapSpaces}${RESET}` : gapSpaces;
     return `${leftPart}${gap}${rightPart}`;
   }
 
-  return fitAnsiColumns(leftPart, cols, { pad: true, padBg: GRUVBOX.bg0Hard });
+  return fitAnsiColumns(leftPart, cols, {
+    pad: true,
+    padBg: theme.bgBar || undefined,
+    ellipsisColor: theme.fgBarDesc,
+  });
 }
 
 function renderAgentListCard(
@@ -208,12 +232,13 @@ function renderAgentListCard(
   selectedItemKey: string | null,
   width: number,
   height: number,
+  theme: DeckTheme,
 ): string[] {
   const isFocused = state.focusMode === "list";
-  const borderColor = isFocused ? GRUVBOX.orange : GRUVBOX.darkGray;
-  const titleColor = isFocused ? `${BOLD}${GRUVBOX.orange}` : GRUVBOX.fg3;
+  const borderColor = isFocused ? theme.borderFocus : theme.borderDefault;
+  const titleColor = isFocused ? `${BOLD}${theme.borderFocus}` : theme.fgSecondary;
   const title = `${titleColor}Agent 队列${RESET}`;
-  const countTag = `${GRUVBOX.gray}${visibleItems.length}/${state.items.length}${RESET}`;
+  const countTag = `${theme.fgMuted}${visibleItems.length}/${state.items.length}${RESET}`;
 
   const innerWidth = Math.max(4, width - 2);
   const innerHeight = Math.max(1, height - 2);
@@ -223,13 +248,19 @@ function renderAgentListCard(
     selectedItemKey,
     innerWidth,
     innerHeight,
+    theme,
   );
 
-  const out: string[] = [renderBoxTop(title, countTag, width, borderColor)];
+  const canvasBg = theme.bgCanvas;
+  const out: string[] = [
+    renderBoxTop(title, countTag, width, borderColor, canvasBg, theme.fgMuted),
+  ];
   for (let i = 0; i < innerHeight; i++) {
-    out.push(renderBoxRow(innerLines[i] ?? "", width, borderColor));
+    out.push(
+      renderBoxRow(innerLines[i] ?? "", width, borderColor, canvasBg || undefined, theme.fgMuted),
+    );
   }
-  out.push(renderBoxBottom(width, borderColor));
+  out.push(renderBoxBottom(width, borderColor, canvasBg));
   return out;
 }
 
@@ -239,6 +270,7 @@ function renderAgentListInner(
   selectedItemKey: string | null,
   width: number,
   height: number,
+  theme: DeckTheme,
 ): string[] {
   if (visibleItems.length === 0) {
     const emptyLines: string[] = [];
@@ -247,9 +279,9 @@ function renderAgentListInner(
       if (r === mid) {
         emptyLines.push(
           fitAnsiColumns(
-            style("  ✓ Inbox Zero — 暂无匹配 Agent", GRUVBOX.green, BOLD),
+            style("  ✓ Inbox Zero — 暂无匹配 Agent", theme.statusReview, BOLD),
             width,
-            { pad: true },
+            { pad: true, ellipsisColor: theme.fgMuted },
           ),
         );
       } else if (r === mid + 1) {
@@ -257,7 +289,12 @@ function renderAgentListInner(
           state.items.length > 0
             ? "  按 [z] 显示空闲或 [f] 切换过滤"
             : "  在任意 Herdr Pane 启动 Claude / Codex / Agy";
-        emptyLines.push(fitAnsiColumns(style(hint, GRUVBOX.gray), width, { pad: true }));
+        emptyLines.push(
+          fitAnsiColumns(style(hint, theme.fgMuted), width, {
+            pad: true,
+            ellipsisColor: theme.fgMuted,
+          }),
+        );
       } else {
         emptyLines.push(" ".repeat(width));
       }
@@ -277,7 +314,7 @@ function renderAgentListInner(
     const groupItems = visibleItems.filter((x) => x.group === grp);
     if (groupItems.length === 0) continue;
 
-    const meta = GROUP_META[grp];
+    const meta = getGroupMeta(grp, theme);
     if (rows.length > 0) {
       rows.push({ text: " ".repeat(width) });
     }
@@ -287,14 +324,14 @@ function renderAgentListInner(
     const fillLen = Math.max(0, width - visibleWidth(headerCore) - 1);
     const headerLine =
       `${meta.color}${BOLD}${headerCore}${RESET}` +
-      `${GRUVBOX.darkGray}${"─".repeat(fillLen)}${RESET}`;
+      `${theme.borderDefault}${"─".repeat(fillLen)}${RESET}`;
     rows.push({
-      text: fitAnsiColumns(headerLine, width, { pad: true }),
+      text: fitAnsiColumns(headerLine, width, { pad: true, ellipsisColor: theme.fgMuted }),
     });
 
     for (const item of groupItems) {
       const isSelected = item.itemKey === selectedItemKey;
-      const [line1, line2] = renderAgentCardRows(state, item, isSelected, width);
+      const [line1, line2] = renderAgentCardRows(state, item, isSelected, width, theme);
       rows.push({ text: line1, itemKey: item.itemKey });
       rows.push({ text: line2, itemKey: item.itemKey });
     }
@@ -329,10 +366,12 @@ function renderAgentListInner(
 function renderGitBadge(
   gitInfo: GitRepoInfo | null | undefined,
   fallbackBranch: string | null | undefined,
+  theme: DeckTheme,
   options: { rowBg?: string; maxCols?: number; includeBranch?: boolean } = {},
 ): string {
   const bg = options.rowBg ?? "";
   const includeBranch = options.includeBranch ?? true;
+  const ellipsisColor = bg ? theme.fgOnSelectedMuted : theme.fgMuted;
   const info: GitRepoInfo | null =
     gitInfo ??
     (fallbackBranch ? { branch: fallbackBranch, dirtyFiles: 0, ahead: 0, behind: 0 } : null);
@@ -340,13 +379,13 @@ function renderGitBadge(
 
   const statusParts: string[] = [];
   if (info.dirtyFiles > 0) {
-    statusParts.push(`${bg}${GRUVBOX.yellow}*${info.dirtyFiles}${RESET}`);
+    statusParts.push(`${bg}${theme.gitDirty}*${info.dirtyFiles}${RESET}`);
   }
   if (info.ahead > 0) {
-    statusParts.push(`${bg}${GRUVBOX.green}↑${info.ahead}${RESET}`);
+    statusParts.push(`${bg}${theme.gitAhead}↑${info.ahead}${RESET}`);
   }
   if (info.behind > 0) {
-    statusParts.push(`${bg}${GRUVBOX.red}↓${info.behind}${RESET}`);
+    statusParts.push(`${bg}${theme.gitBehind}↓${info.behind}${RESET}`);
   }
   const statusStr = statusParts.join(`${bg} `);
 
@@ -354,18 +393,25 @@ function renderGitBadge(
     return statusStr;
   }
 
-  const branchPrefix = `${bg}${GRUVBOX.aqua}⎇ `;
+  const branchPrefix = `${bg}${theme.gitBranch}⎇ `;
   const statusCols = statusStr ? visibleWidth(statusStr) + 1 : 0;
   let branchText = info.branch;
 
   if (options.maxCols !== undefined) {
     const branchBudget = options.maxCols - 2 - statusCols;
     if (branchBudget >= 4) {
-      branchText = fitAnsiColumns(info.branch, branchBudget, { ellipsis: "…" });
+      branchText = fitAnsiColumns(info.branch, branchBudget, {
+        ellipsis: "…",
+        ellipsisColor: theme.gitBranch,
+      });
     } else if (statusStr && visibleWidth(statusStr) <= options.maxCols) {
       return statusStr;
     } else {
-      return fitAnsiColumns(`${branchPrefix}${info.branch}${RESET}`, options.maxCols, { ellipsis: "…" });
+      return fitAnsiColumns(`${branchPrefix}${info.branch}${RESET}`, options.maxCols, {
+        ellipsis: "…",
+        padBg: bg || undefined,
+        ellipsisColor,
+      });
     }
   }
 
@@ -378,45 +424,58 @@ function renderAgentCardRows(
   item: DeckAgentItem,
   isSelected: boolean,
   width: number,
+  theme: DeckTheme,
 ): [string, string] {
-  const rowBg = isSelected
-    ? item.group === "needs_you"
-      ? GRUVBOX.bgUrgent
-      : GRUVBOX.bg1
-    : "";
+  const isUrgent = item.group === "needs_you";
+  const isSelectedUrgent = isSelected && isUrgent;
+  const isSelectedNormal = isSelected && !isUrgent;
 
-  const cursorBar = isSelected ? `${rowBg}${GRUVBOX.orange}${BOLD}▌` : " ";
+  const rowBg = isSelectedUrgent
+    ? theme.bgUrgent
+    : isSelectedNormal
+      ? theme.bgSelected
+      : theme.bgCanvas;
+
+  const rowEllipsisColor = isSelectedUrgent
+    ? theme.fgOnUrgentMuted
+    : isSelectedNormal
+      ? theme.fgOnSelectedMuted
+      : theme.fgMuted;
+
+  const cursorColor = isSelectedUrgent ? theme.fgUrgentAccent : theme.accent;
+  const cursorBar = isSelected ? `${rowBg}${cursorColor}${BOLD}▌` : " ";
 
   const spin = SPINNER_FRAMES[state.spinnerTick % SPINNER_FRAMES.length]!;
   let icon = "○";
-  let iconColor: string = GRUVBOX.gray;
+  let iconColor: string = isSelectedNormal ? theme.fgOnSelectedMuted : theme.statusIdle;
   let rightRendered = "";
   let rightCols = 0;
 
   const elapsed = Math.max(0, state.nowMs - item.sinceMs);
-  if (item.group === "needs_you") {
+  if (isUrgent) {
     icon = "!";
-    iconColor = GRUVBOX.red;
+    iconColor = isSelected ? theme.fgUrgentBadge : theme.statusUrgent;
     const timerStr = `⚑ ${formatDurationCompact(elapsed)}`;
-    rightRendered = `${rowBg}${BOLD}${GRUVBOX.orange}${timerStr} ${RESET}`;
+    const timerColor = isSelected ? theme.fgUrgentAccent : theme.accentWarm;
+    rightRendered = `${rowBg}${BOLD}${timerColor}${timerStr} ${RESET}`;
     rightCols = visibleWidth(timerStr) + 1;
   } else if (item.group === "review") {
     icon = "✓";
-    iconColor = GRUVBOX.green;
+    iconColor = theme.statusReview;
     const timerStr = formatRelativeAge(elapsed);
-    rightRendered = `${rowBg}${GRUVBOX.green}${timerStr} ${RESET}`;
+    rightRendered = `${rowBg}${theme.statusReview}${timerStr} ${RESET}`;
     rightCols = visibleWidth(timerStr) + 1;
   } else if (item.group === "working") {
     icon = spin;
-    iconColor = GRUVBOX.yellow;
+    iconColor = theme.statusWorking;
     const timerStr = `↻ ${formatDurationCompact(elapsed)}`;
-    rightRendered = `${rowBg}${GRUVBOX.yellow}${timerStr} ${RESET}`;
+    rightRendered = `${rowBg}${theme.statusWorking}${timerStr} ${RESET}`;
     rightCols = visibleWidth(timerStr) + 1;
   } else {
     icon = "○";
-    iconColor = GRUVBOX.gray;
+    iconColor = isSelected ? theme.fgOnSelectedMuted : theme.statusIdle;
     const maxGitCols = Math.max(8, Math.floor(width * 0.48));
-    const gitBadge = renderGitBadge(item.gitInfo, item.branch, {
+    const gitBadge = renderGitBadge(item.gitInfo, item.branch, theme, {
       rowBg,
       maxCols: maxGitCols,
       includeBranch: true,
@@ -427,10 +486,17 @@ function renderAgentCardRows(
     }
   }
 
-  // Distinct deterministic color per primaryTitle so multiple agents in one workspace stand out immediately
-  const nameColor = pickNameColor(item.primaryTitle);
+  // Distinct deterministic color per primaryTitle; override on selected urgent rows when terminal uses ANSI red bg
+  const baseNameColor = pickNameColor(item.primaryTitle, theme.namePalette, theme.fgPrimary);
+  const nameColor =
+    isSelectedUrgent && theme.fgUrgentTitleOverride ? theme.fgUrgentTitleOverride : baseNameColor;
   const titleStyle = isSelected ? `${BOLD}${nameColor}` : nameColor;
-  const currentDot = item.focusedInHerdr ? `${rowBg}${GRUVBOX.fg3} •${RESET}` : "";
+  const dotColor = isSelectedUrgent
+    ? theme.fgOnUrgentMuted
+    : isSelectedNormal
+      ? theme.fgOnSelectedMuted
+      : theme.fgSecondary;
+  const currentDot = item.focusedInHerdr ? `${rowBg}${dotColor} •${RESET}` : "";
 
   const leftHeadline =
     `${cursorBar}${rowBg}${iconColor}${BOLD}${icon}${RESET}` +
@@ -442,30 +508,51 @@ function renderAgentCardRows(
     const fittedLeft = fitAnsiColumns(leftHeadline, leftBudget, {
       pad: true,
       padBg: rowBg || undefined,
+      ellipsisColor: rowEllipsisColor,
     });
-    line1 = fitAnsiColumns(`${fittedLeft} ${rightRendered}`, width, {
+    const gapSpace = rowBg ? `${rowBg} ${RESET}` : " ";
+    line1 = fitAnsiColumns(`${fittedLeft}${gapSpace}${rightRendered}`, width, {
       pad: true,
       padBg: rowBg || undefined,
+      ellipsisColor: rowEllipsisColor,
     });
   } else {
     line1 = fitAnsiColumns(leftHeadline, width, {
       pad: true,
       padBg: rowBg || undefined,
+      ellipsisColor: rowEllipsisColor,
     });
   }
 
   // Line 2: compact meta (`@machine·agent` or `workspace·agent`) + cleaned summary
   const subPrefix = isSelected
-    ? `${rowBg}${GRUVBOX.orange}${BOLD}▌${RESET}${rowBg}  `
+    ? `${rowBg}${cursorColor}${BOLD}▌${RESET}${rowBg}  `
     : "   ";
   const showWorkspaceInMeta =
     item.primaryTitle.toLowerCase() !== item.workspaceLabel.toLowerCase();
-  const metaColor = isSelected ? GRUVBOX.fg3 : GRUVBOX.darkGray;
-  const summaryColor = isSelected ? GRUVBOX.fg2 : GRUVBOX.gray;
+  const metaColor = isSelectedUrgent
+    ? theme.fgOnUrgentMuted
+    : isSelectedNormal
+      ? theme.fgOnSelectedMuted
+      : theme.fgSubtle;
+  const summaryColor = isSelectedUrgent
+    ? theme.fgOnUrgent
+    : isSelectedNormal
+      ? theme.fgOnSelected
+      : theme.fgMuted;
+  const dividerColor = isSelectedUrgent
+    ? theme.fgOnUrgentMuted
+    : isSelectedNormal
+      ? theme.fgOnSelectedDivider
+      : theme.borderDefault;
 
   let metaRendered: string;
   if (item.machineLabel) {
-    const machinePrefix = `${rowBg}${GRUVBOX.purple}@${item.machineLabel}${RESET}`;
+    const machineColor =
+      isSelectedUrgent && theme.fgUrgentTitleOverride
+        ? theme.fgUrgentTitleOverride
+        : theme.accentRemote;
+    const machinePrefix = `${rowBg}${machineColor}@${item.machineLabel}${RESET}`;
     metaRendered = `${machinePrefix}${rowBg}${metaColor}·${item.agentDisplayName}${RESET}`;
   } else {
     const metaTag = showWorkspaceInMeta
@@ -476,12 +563,13 @@ function renderAgentCardRows(
 
   const line2Raw =
     `${subPrefix}${metaRendered}` +
-    `${rowBg}${GRUVBOX.darkGray} │ ${RESET}` +
+    `${rowBg}${dividerColor} │ ${RESET}` +
     `${rowBg}${summaryColor}${item.summary}${RESET}`;
 
   const line2 = fitAnsiColumns(line2Raw, width, {
     pad: true,
     padBg: rowBg || undefined,
+    ellipsisColor: rowEllipsisColor,
   });
 
   return [line1, line2];
@@ -494,12 +582,13 @@ function renderRightColumn(
   height: number,
   startCol1Based: number,
   startRow1Based: number,
+  theme: DeckTheme,
 ): { lines: string[]; cursor: { row: number; col: number } | null } {
   // Reserve fixed 3-row rounded reply/action box at the bottom of the right column
   const replyBoxHeight = 3;
   const previewBoxHeight = Math.max(4, height - replyBoxHeight);
 
-  const previewLines = renderPreviewCard(state, selected, width, previewBoxHeight);
+  const previewLines = renderPreviewCard(state, selected, width, previewBoxHeight, theme);
   const replyStartRow = startRow1Based + previewBoxHeight;
   const reply = renderInlineReplyCard(
     state,
@@ -508,6 +597,7 @@ function renderRightColumn(
     replyBoxHeight,
     startCol1Based,
     replyStartRow,
+    theme,
   );
 
   return {
@@ -521,40 +611,45 @@ function renderPreviewCard(
   selected: DeckAgentItem | null,
   width: number,
   height: number,
+  theme: DeckTheme,
 ): string[] {
   const isBlocked = selected?.group === "needs_you";
   const borderColor =
-    isBlocked && state.focusMode !== "reply" ? GRUVBOX.red : GRUVBOX.darkGray;
+    isBlocked && state.focusMode !== "reply" ? theme.borderUrgent : theme.borderDefault;
+  const canvasBg = theme.bgCanvas;
 
-  let headerTitle = `${GRUVBOX.gray}终端快照${RESET}`;
+  let headerTitle = `${theme.fgMuted}终端快照${RESET}`;
   let rightTag = "";
 
   if (selected) {
-    const titleColor = pickNameColor(selected.primaryTitle);
-    const gitBadge = renderGitBadge(selected.gitInfo, selected.branch, { includeBranch: true });
+    const titleColor = pickNameColor(selected.primaryTitle, theme.namePalette, theme.fgPrimary);
+    const gitBadge = renderGitBadge(selected.gitInfo, selected.branch, theme, {
+      includeBranch: true,
+    });
     const cwdPart = selected.cwd
-      ? ` ${GRUVBOX.gray}${selected.machineId ? selected.cwd : shortenHome(selected.cwd)}${RESET}`
+      ? ` ${theme.fgMuted}${selected.machineId ? selected.cwd : shortenHome(selected.cwd)}${RESET}`
       : "";
     const machinePart = selected.machineLabel
-      ? `${GRUVBOX.purple}${BOLD}@${selected.machineLabel}${RESET}${GRUVBOX.gray} · `
+      ? `${theme.accentRemote}${BOLD}@${selected.machineLabel}${RESET}${theme.fgMuted} · `
       : "";
     const baseTitle =
       `${machinePart}${titleColor}${BOLD}${selected.primaryTitle}${RESET}` +
-      `${GRUVBOX.gray} · ${GRUVBOX.fg3}${selected.workspaceLabel} › ${selected.tabLabel} › ${GRUVBOX.yellow}${selected.agentDisplayName}${RESET}`;
+      `${theme.fgMuted} · ${theme.fgSecondary}${selected.workspaceLabel} › ${selected.tabLabel} › ${theme.statusWorking}${selected.agentDisplayName}${RESET}`;
 
     if (isBlocked) {
       const branchPart = gitBadge ? ` ${gitBadge}` : "";
       headerTitle = baseTitle + branchPart + (width >= 88 ? cwdPart : "");
-      rightTag = `${GRUVBOX.bgUrgent}${GRUVBOX.red}${BOLD} ! 待审批 ${RESET}`;
+      rightTag = `${theme.bgUrgent}${theme.fgUrgentBadge}${BOLD} ! 待审批 ${RESET}`;
     } else {
       const maxGitCols = Math.max(12, Math.floor(width * 0.42));
-      const fittedGitBadge = renderGitBadge(selected.gitInfo, selected.branch, {
+      const fittedGitBadge = renderGitBadge(selected.gitInfo, selected.branch, theme, {
         maxCols: maxGitCols,
         includeBranch: true,
       });
       const canShowCwd =
         width >= 88 &&
-        visibleWidth(baseTitle + cwdPart) + (fittedGitBadge ? visibleWidth(fittedGitBadge) + 6 : 0) <=
+        visibleWidth(baseTitle + cwdPart) +
+          (fittedGitBadge ? visibleWidth(fittedGitBadge) + 6 : 0) <=
           width - 6;
       headerTitle = baseTitle + (canShowCwd ? cwdPart : "");
       rightTag = fittedGitBadge;
@@ -564,13 +659,15 @@ function renderPreviewCard(
   const innerWidth = Math.max(4, width - 2);
   const innerHeight = Math.max(1, height - 2);
 
-  const out: string[] = [renderBoxTop(headerTitle, rightTag, width, borderColor)];
+  const out: string[] = [
+    renderBoxTop(headerTitle, rightTag, width, borderColor, canvasBg, theme.fgMuted),
+  ];
 
   if (!selected) {
     for (let i = 0; i < innerHeight; i++) {
-      out.push(renderBoxRow("", width, borderColor));
+      out.push(renderBoxRow("", width, borderColor, canvasBg || undefined, theme.fgMuted));
     }
-    out.push(renderBoxBottom(width, borderColor));
+    out.push(renderBoxBottom(width, borderColor, canvasBg));
     return out;
   }
 
@@ -586,11 +683,10 @@ function renderPreviewCard(
   if (rawLines.length === 0) {
     const mid = Math.floor(innerHeight / 2);
     for (let i = 0; i < innerHeight; i++) {
-      const content =
-        i === mid ? style("  (正在加载终端画面…)", GRUVBOX.gray, DIM) : "";
-      out.push(renderBoxRow(content, width, borderColor));
+      const content = i === mid ? style("  (正在加载终端画面…)", theme.fgMuted) : "";
+      out.push(renderBoxRow(content, width, borderColor, canvasBg || undefined, theme.fgMuted));
     }
-    out.push(renderBoxBottom(width, borderColor));
+    out.push(renderBoxBottom(width, borderColor, canvasBg));
     return out;
   }
 
@@ -609,14 +705,16 @@ function renderPreviewCard(
   for (let i = 0; i < innerHeight; i++) {
     const line = slice[i];
     if (line === undefined) {
-      out.push(renderBoxRow("", width, borderColor));
+      out.push(renderBoxRow("", width, borderColor, canvasBg || undefined, theme.fgMuted));
     } else {
       const fitted = fitAnsiColumns(line, contentCols, { pad: true, ellipsis: "" });
-      out.push(renderBoxRow(` ${fitted} `, width, borderColor));
+      out.push(
+        renderBoxRow(` ${fitted} `, width, borderColor, canvasBg || undefined, theme.fgMuted),
+      );
     }
   }
 
-  out.push(renderBoxBottom(width, borderColor));
+  out.push(renderBoxBottom(width, borderColor, canvasBg));
   return out;
 }
 
@@ -627,61 +725,65 @@ function renderInlineReplyCard(
   height: number,
   startCol1Based: number,
   startRow1Based: number,
+  theme: DeckTheme,
 ): { lines: string[]; cursor: { row: number; col: number } | null } {
   const isReply = state.focusMode === "reply";
   const isRename = state.focusMode === "rename";
   const isEditing = isReply || isRename;
   const isBlocked = selected?.group === "needs_you";
+  const canvasBg = theme.bgCanvas;
 
   const borderColor = isRename
-    ? GRUVBOX.aqua
+    ? theme.borderRename
     : isReply
-      ? GRUVBOX.yellow
+      ? theme.borderReply
       : isBlocked
-        ? GRUVBOX.orange
-        : GRUVBOX.darkGray;
+        ? theme.borderBlockedAction
+        : theme.borderDefault;
 
   const targetName = selected ? selected.primaryTitle : "Agent";
   const title = isRename
-    ? `${GRUVBOX.aqua}${BOLD}重命名 Pane → ${targetName}${RESET}`
+    ? `${theme.borderRename}${BOLD}重命名 Pane → ${targetName}${RESET}`
     : isReply
-      ? `${GRUVBOX.yellow}${BOLD}回复 → ${targetName}${RESET}`
+      ? `${theme.borderReply}${BOLD}回复 → ${targetName}${RESET}`
       : isBlocked
-        ? `${GRUVBOX.orange}${BOLD}快速审批 / 回复${RESET}`
-        : `${GRUVBOX.fg3}快速回复${RESET}`;
+        ? `${theme.borderBlockedAction}${BOLD}快速审批 / 回复${RESET}`
+        : `${theme.fgSecondary}快速回复${RESET}`;
 
   const isRemote = Boolean(selected?.machineId);
   const rightTag = isRename
-    ? `${GRUVBOX.gray}Enter 保存 · 留空清除 · Esc 取消${RESET}`
+    ? `${theme.fgMuted}Enter 保存 · 留空清除 · Esc 取消${RESET}`
     : isReply
-      ? `${GRUVBOX.gray}Enter 发送 · Esc 取消${RESET}`
+      ? `${theme.fgMuted}Enter 发送 · Esc 取消${RESET}`
       : isBlocked
         ? isRemote
-          ? `${GRUVBOX.gray}[y/n/1-4] 审批 · [r] 回复${RESET}`
-          : `${GRUVBOX.gray}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
+          ? `${theme.fgMuted}[y/n/1-4] 审批 · [r] 回复${RESET}`
+          : `${theme.fgMuted}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
         : isRemote
-          ? `${GRUVBOX.gray}[r] 输入 · [R] 重命名 · 远端仅原地操作${RESET}`
-          : `${GRUVBOX.gray}[r] 输入 · [R] 重命名 · [Enter] 进终端${RESET}`;
+          ? `${theme.fgMuted}[r] 输入 · [R] 重命名 · 远端仅原地操作${RESET}`
+          : `${theme.fgMuted}[r] 输入 · [R] 重命名 · [Enter] 进终端${RESET}`;
 
   let content = "";
-  let rowBg: string | undefined;
+  let rowBg: string | undefined = canvasBg || undefined;
+  let rowEllipsisColor = theme.fgMuted;
   let cursor: { row: number; col: number } | null = null;
 
   if (isEditing) {
-    rowBg = GRUVBOX.bg1;
+    rowBg = theme.bgSelected || undefined;
+    rowEllipsisColor = theme.fgOnSelectedMuted;
     // Inner width excludes left/right │ borders (2 cols) and leading " ❯ " prompt (3 cols)
     const innerWidth = Math.max(4, width - 2);
     const promptPrefixWidth = 3;
     const inputCols = Math.max(2, innerWidth - promptPrefixWidth);
     const activeDraft = isRename ? state.renameDraft : state.replyDraft;
     const activeCursor = isRename ? state.renameCursor : state.replyCursor;
-    const promptColor = isRename ? GRUVBOX.aqua : GRUVBOX.yellow;
+    const promptColor = isRename ? theme.borderRename : theme.borderReply;
     const { visibleText, cursorCellOffset } = layoutEditableInput(
       activeDraft,
       activeCursor,
       inputCols,
     );
-    content = `${GRUVBOX.bg1}${promptColor}${BOLD} ❯ ${RESET}${GRUVBOX.bg1}${GRUVBOX.fg0}${visibleText}${RESET}`;
+    content = `${theme.bgSelected}${promptColor}${BOLD} ❯ ${RESET}${theme.bgSelected}${theme.fgOnSelected}${visibleText}${RESET}`;
     // 1-based cursor coordinates inside the inline input row (enables macOS CJK IME preedit)
     cursor = {
       row: startRow1Based + 1,
@@ -690,35 +792,39 @@ function renderInlineReplyCard(
   } else if (state.toastMessage) {
     const color =
       state.toastKind === "error"
-        ? GRUVBOX.red
+        ? theme.toastError
         : state.toastKind === "warn"
-          ? GRUVBOX.orange
+          ? theme.toastWarn
           : state.toastKind === "ok"
-            ? GRUVBOX.green
-            : GRUVBOX.aqua;
+            ? theme.toastOk
+            : theme.toastInfo;
     content = `${color}${BOLD} ✦ ${state.toastMessage}${RESET}`;
   } else if (!selected) {
-    content = `${GRUVBOX.gray} 暂无可操作 Agent${RESET}`;
+    content = `${theme.fgMuted} 暂无可操作 Agent${RESET}`;
   } else if (isBlocked) {
-    rowBg = GRUVBOX.bgUrgent;
+    rowBg = theme.bgUrgent || undefined;
+    rowEllipsisColor = theme.fgOnUrgentMuted;
     content = isRemote
-      ? `${GRUVBOX.bgUrgent}${GRUVBOX.orange}${BOLD} ❯ ${RESET}${GRUVBOX.bgUrgent}${GRUVBOX.fg1}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项（远端机器不支持 Enter 跳转）${RESET}`
-      : `${GRUVBOX.bgUrgent}${GRUVBOX.orange}${BOLD} ❯ ${RESET}${GRUVBOX.bgUrgent}${GRUVBOX.fg1}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项 · 或 [Enter] 进入终端处理${RESET}`;
+      ? `${theme.bgUrgent}${theme.fgUrgentAccent}${BOLD} ❯ ${RESET}${theme.bgUrgent}${theme.fgOnUrgent}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项（远端机器不支持 Enter 跳转）${RESET}`
+      : `${theme.bgUrgent}${theme.fgUrgentAccent}${BOLD} ❯ ${RESET}${theme.bgUrgent}${theme.fgOnUrgent}按 [y] 同意 · [n] 拒绝 · [1-4] 选第 N 项 · 或 [Enter] 进入终端处理${RESET}`;
   } else {
+    const targetColor = pickNameColor(targetName, theme.namePalette, theme.fgPrimary);
     content = isRemote
-      ? `${GRUVBOX.gray} ❯ 按 ${GRUVBOX.fg2}[r]${GRUVBOX.gray} 一句话派活给 ${GRUVBOX.purple}@${selected.machineLabel}${GRUVBOX.gray} ${pickNameColor(targetName)}${targetName}${GRUVBOX.gray}（远端暂不支持 Enter 跳转）${RESET}`
-      : `${GRUVBOX.gray} ❯ 按 ${GRUVBOX.fg2}[r]${GRUVBOX.gray} 一句话派活给 ${pickNameColor(targetName)}${targetName}${GRUVBOX.gray}，或 ${GRUVBOX.fg2}[Enter]${GRUVBOX.gray} 深入终端${RESET}`;
+      ? `${theme.fgMuted} ❯ 按 ${theme.fgSecondary}[r]${theme.fgMuted} 一句话派活给 ${theme.accentRemote}@${selected.machineLabel}${theme.fgMuted} ${targetColor}${targetName}${theme.fgMuted}（远端暂不支持 Enter 跳转）${RESET}`
+      : `${theme.fgMuted} ❯ 按 ${theme.fgSecondary}[r]${theme.fgMuted} 一句话派活给 ${targetColor}${targetName}${theme.fgMuted}，或 ${theme.fgSecondary}[Enter]${theme.fgMuted} 深入终端${RESET}`;
   }
 
-  const out: string[] = [renderBoxTop(title, rightTag, width, borderColor)];
+  const out: string[] = [
+    renderBoxTop(title, rightTag, width, borderColor, canvasBg, theme.fgMuted),
+  ];
   if (height >= 3) {
-    out.push(renderBoxRow(content, width, borderColor, rowBg));
+    out.push(renderBoxRow(content, width, borderColor, rowBg, rowEllipsisColor));
   }
-  out.push(renderBoxBottom(width, borderColor));
+  out.push(renderBoxBottom(width, borderColor, canvasBg));
   return { lines: out, cursor };
 }
 
-function renderCheatsheetBody(cols: number, height: number): string[] {
+function renderCheatsheetBody(cols: number, height: number, theme: DeckTheme): string[] {
   const modalWidth = Math.min(72, Math.max(44, cols - 6));
   const padLeft = Math.floor((cols - modalWidth) / 2);
   const padRight = Math.max(0, cols - padLeft - modalWidth);
@@ -757,57 +863,70 @@ function renderCheatsheetBody(cols: number, height: number): string[] {
 
   const modalRows: string[] = [];
   const innerWidth = modalWidth - 2;
-  const bg = GRUVBOX.bgModal;
+  const bg = theme.bgModal;
+  const borderColor = theme.borderFocus;
 
   modalRows.push(
     renderBoxTop(
-      `${GRUVBOX.orange}${BOLD}Herdr Deck 快捷键速查${RESET}`,
-      `${GRUVBOX.gray}? / Esc 关闭${RESET}`,
+      `${borderColor}${BOLD}Herdr Deck 快捷键速查${RESET}`,
+      `${theme.fgModalMuted}? / Esc 关闭${RESET}`,
       modalWidth,
-      GRUVBOX.orange,
+      borderColor,
       bg,
+      theme.fgModalMuted,
     ),
   );
 
   for (let s = 0; s < sections.length; s++) {
     const sec = sections[s]!;
     if (s > 0) {
-      modalRows.push(renderBoxRow("", modalWidth, GRUVBOX.orange, bg));
+      modalRows.push(renderBoxRow("", modalWidth, borderColor, bg || undefined, theme.fgModalMuted));
     }
     modalRows.push(
       renderBoxRow(
-        `${bg} ${GRUVBOX.aqua}${BOLD}▸ ${sec.heading}${RESET}`,
+        `${bg} ${theme.fgModalHeading}${BOLD}▸ ${sec.heading}${RESET}`,
         modalWidth,
-        GRUVBOX.orange,
-        bg,
+        borderColor,
+        bg || undefined,
+        theme.fgModalMuted,
       ),
     );
     for (const [k, desc] of sec.rows) {
-      const keyCol = fitAnsiColumns(`${bg}   ${GRUVBOX.yellow}${BOLD}${k}${RESET}`, 20, {
+      const keyCol = fitAnsiColumns(`${bg}   ${theme.fgModalKey}${BOLD}${k}${RESET}`, 20, {
         pad: true,
-        padBg: bg,
+        padBg: bg || undefined,
+        ellipsisColor: theme.fgModalMuted,
       });
-      const descCol = `${bg}${GRUVBOX.fg1}${desc}${RESET}`;
+      const descCol = `${bg}${theme.fgModalText}${desc}${RESET}`;
+      const colSep = bg ? `${bg} ${RESET}` : " ";
       modalRows.push(
         renderBoxRow(
-          fitAnsiColumns(`${keyCol} ${descCol}`, innerWidth, { pad: true, padBg: bg }),
+          fitAnsiColumns(`${keyCol}${colSep}${descCol}`, innerWidth, {
+            pad: true,
+            padBg: bg || undefined,
+            ellipsisColor: theme.fgModalMuted,
+          }),
           modalWidth,
-          GRUVBOX.orange,
-          bg,
+          borderColor,
+          bg || undefined,
+          theme.fgModalMuted,
         ),
       );
     }
   }
 
-  modalRows.push(renderBoxBottom(modalWidth, GRUVBOX.orange, bg));
+  modalRows.push(renderBoxBottom(modalWidth, borderColor, bg));
 
   const trimmedModal = modalRows.slice(0, height);
   const topPad = Math.max(0, Math.floor((height - trimmedModal.length) / 2));
 
   const out: string[] = [];
-  const blankFull = `${GRUVBOX.bg0Hard}${" ".repeat(cols)}${RESET}`;
-  const leftMargin = `${GRUVBOX.bg0Hard}${" ".repeat(padLeft)}${RESET}`;
-  const rightMargin = `${GRUVBOX.bg0Hard}${" ".repeat(padRight)}${RESET}`;
+  const backdropBg = theme.bgBar;
+  const blankFull = backdropBg ? `${backdropBg}${" ".repeat(cols)}${RESET}` : " ".repeat(cols);
+  const leftMargin = backdropBg ? `${backdropBg}${" ".repeat(padLeft)}${RESET}` : " ".repeat(padLeft);
+  const rightMargin = backdropBg
+    ? `${backdropBg}${" ".repeat(padRight)}${RESET}`
+    : " ".repeat(padRight);
 
   for (let r = 0; r < height; r++) {
     const mIdx = r - topPad;
@@ -821,13 +940,11 @@ function renderCheatsheetBody(cols: number, height: number): string[] {
   return out;
 }
 
-function renderFooterBar(state: RenderState, cols: number): string {
+function renderFooterBar(state: RenderState, cols: number, theme: DeckTheme): string {
   let hints: Array<[string, string]>;
 
   if (state.showHelp) {
-    hints = [
-      ["? / Esc", "返回面板"],
-    ];
+    hints = [["? / Esc", "返回面板"]];
   } else if (state.focusMode === "rename") {
     hints = [
       ["Enter", "保存名称"],
@@ -851,14 +968,21 @@ function renderFooterBar(state: RenderState, cols: number): string {
     ];
   }
 
+  const barBg = theme.bgBar;
+  const sep = barBg ? `${barBg}  ${RESET}` : "  ";
   const formatted = hints
     .map(
       ([k, desc]) =>
-        `${GRUVBOX.bg0Hard}${GRUVBOX.yellow}${BOLD}[${k}]${RESET}${GRUVBOX.bg0Hard}${GRUVBOX.fg3} ${desc}${RESET}`,
+        `${barBg}${theme.fgBarKey}${BOLD}[${k}]${RESET}${barBg}${theme.fgBarDesc} ${desc}${RESET}`,
     )
-    .join(`${GRUVBOX.bg0Hard}  ${RESET}`);
+    .join(sep);
 
-  return fitAnsiColumns(` ${formatted}`, cols, { pad: true, padBg: GRUVBOX.bg0Hard });
+  const leadingSpace = barBg ? `${barBg} ${RESET}` : " ";
+  return fitAnsiColumns(`${leadingSpace}${formatted}`, cols, {
+    pad: true,
+    padBg: barBg || undefined,
+    ellipsisColor: theme.fgBarDesc,
+  });
 }
 
 function shortenHome(p: string): string {

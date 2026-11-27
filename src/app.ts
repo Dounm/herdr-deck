@@ -1,4 +1,14 @@
 import { refreshGitInfoForCwds, type GitCacheEntry } from "./git.ts";
+import {
+  buildOsc11Query,
+  detectTerminalAppearanceFromEnv,
+  extractOsc11FromInput,
+  loadHerdrThemeConfig,
+  resolveThemeFromHerdrConfig,
+  watchHerdrConfig,
+  type HerdrConfigWatcher,
+  type HerdrThemeConfig,
+} from "./herdr-config.ts";
 import { parseTerminalInput, type ParsedKey } from "./keys.ts";
 import {
   buildMultiMachineDeckItems,
@@ -16,6 +26,7 @@ import {
   recordAgentStatusTransition,
   saveDeckState,
 } from "./state.ts";
+import { getThemeSignature, type AppearanceMode, type DeckTheme } from "./theme.ts";
 import type {
   AgentStatus,
   DeckAgentItem,
@@ -61,12 +72,24 @@ function readOriginFocusedPaneId(): string | null {
 const REMOTE_SNAPSHOT_INTERVAL_MS = 4500;
 const REMOTE_MACHINE_LIST_TTL_MS = 30000;
 const REMOTE_PREVIEW_POLL_INTERVAL_MS = 3600;
+const OSC11_PENDING_TIMEOUT_MS = 120;
 
 export async function runTuiApp(): Promise<void> {
   const client = new HerdrSocketClient();
   const remoteClient = new HerdrMachineCliClient();
   const selfPaneId = process.env.HERDR_PANE_ID ?? null;
   let originFocusedPaneId: string | null = readOriginFocusedPaneId();
+
+  // Synchronously load active Herdr theme before frame 1 (zero flash)
+  let currentAppearance: AppearanceMode = detectTerminalAppearanceFromEnv();
+  let activeConfig: HerdrThemeConfig = loadHerdrThemeConfig();
+  let activeTheme: DeckTheme = resolveThemeFromHerdrConfig(activeConfig, currentAppearance);
+  let activeThemeSig = getThemeSignature(activeTheme);
+  let stdinReady = false;
+  let osc11QuerySent = false;
+  let pendingOsc11 = "";
+  let pendingOsc11Timer: NodeJS.Timeout | null = null;
+  let configWatcher: HerdrConfigWatcher | null = null;
 
   let persisted: PersistedDeckState = loadDeckState();
 
@@ -141,6 +164,7 @@ export async function runTuiApp(): Promise<void> {
     toastKind,
     spinnerTick,
     nowMs: Date.now(),
+    theme: activeTheme,
   });
 
   const getCurrentVisible = (): DeckAgentItem[] => getVisibleItems(buildRenderState());
@@ -164,6 +188,55 @@ export async function runTuiApp(): Promise<void> {
       process.stdout.write(frame);
     });
   };
+
+  const clearPendingOsc11Timer = () => {
+    if (pendingOsc11Timer) {
+      clearTimeout(pendingOsc11Timer);
+      pendingOsc11Timer = null;
+    }
+  };
+
+  const maybeQueryOsc11 = () => {
+    if (
+      exiting ||
+      !stdinReady ||
+      osc11QuerySent ||
+      !activeConfig.autoSwitch ||
+      !process.stdout.isTTY
+    ) {
+      return;
+    }
+    osc11QuerySent = true;
+    process.stdout.write(buildOsc11Query());
+  };
+
+  const applyTheme = (nextTheme: DeckTheme, nextConfig?: HerdrThemeConfig) => {
+    if (nextConfig) {
+      activeConfig = nextConfig;
+    }
+    const nextSig = getThemeSignature(nextTheme);
+    if (nextSig !== activeThemeSig) {
+      activeTheme = nextTheme;
+      activeThemeSig = nextSig;
+      scheduleRender(true);
+    }
+  };
+
+  configWatcher = watchHerdrConfig(
+    (nextTheme, nextConfig) => {
+      if (exiting) return;
+      if (!nextConfig.autoSwitch) {
+        osc11QuerySent = false;
+      }
+      applyTheme(nextTheme, nextConfig);
+      if (nextConfig.autoSwitch) {
+        maybeQueryOsc11();
+      }
+    },
+    {
+      getAppearance: () => currentAppearance,
+    },
+  );
 
   const rebuildItemsFromSnapshot = () => {
     const sources: MachineSnapshotSource[] = [];
@@ -478,6 +551,9 @@ export async function runTuiApp(): Promise<void> {
     if (exiting) return;
     exiting = true;
     subHandle?.close();
+    configWatcher?.close();
+    configWatcher = null;
+    clearPendingOsc11Timer();
     if (previewDebounceTimer) clearTimeout(previewDebounceTimer);
     if (previewRefreshTimer) clearInterval(previewRefreshTimer);
     if (toastTimer) clearTimeout(toastTimer);
@@ -1045,8 +1121,8 @@ export async function runTuiApp(): Promise<void> {
   }
   process.stdin.resume();
 
-  process.stdin.on("data", (buf: Buffer) => {
-    const keys = parseTerminalInput(buf);
+  const dispatchParsedKeys = (keys: ParsedKey[]) => {
+    if (keys.length === 0 || exiting) return;
     void (async () => {
       try {
         for (const k of keys) {
@@ -1065,7 +1141,50 @@ export async function runTuiApp(): Promise<void> {
         }
       }
     })();
+  };
+
+  process.stdin.on("data", (buf: Buffer) => {
+    if (exiting) return;
+
+    // Bypass OSC 11 filtering completely when no OSC 11 query is active and nothing is buffered
+    if (!osc11QuerySent && !pendingOsc11) {
+      dispatchParsedKeys(parseTerminalInput(buf));
+      return;
+    }
+
+    const filtered = extractOsc11FromInput(buf.toString("utf8"), pendingOsc11);
+    pendingOsc11 = filtered.pending;
+    clearPendingOsc11Timer();
+    if (pendingOsc11) {
+      pendingOsc11Timer = setTimeout(() => {
+        const stale = pendingOsc11;
+        pendingOsc11 = "";
+        pendingOsc11Timer = null;
+        // Flush non-OSC-11 user sequences (e.g. Alt+]) instead of swallowing them; drop truncated OSC 11 payloads
+        if (!exiting && stale && !stale.startsWith("\x1b]11;")) {
+          dispatchParsedKeys(parseTerminalInput(Buffer.from(stale, "utf8")));
+        }
+      }, OSC11_PENDING_TIMEOUT_MS);
+      pendingOsc11Timer.unref();
+    }
+
+    if (filtered.appearance && filtered.appearance !== currentAppearance) {
+      currentAppearance = filtered.appearance;
+      const nextTheme = configWatcher
+        ? configWatcher.reload()
+        : resolveThemeFromHerdrConfig(activeConfig, currentAppearance);
+      applyTheme(nextTheme);
+    }
+
+    if (!filtered.passthrough) {
+      return;
+    }
+
+    dispatchParsedKeys(parseTerminalInput(Buffer.from(filtered.passthrough, "utf8")));
   });
+
+  stdinReady = true;
+  maybeQueryOsc11();
 
   process.stdout.on("resize", () => {
     scheduleRender(true);

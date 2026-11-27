@@ -1,68 +1,35 @@
-// Gruvbox Dark 24-bit TrueColor palette & ANSI helpers for Herdr Deck
+// ANSI escape helpers, Unicode/CJK cell width measurement, box drawing, and soft-wrapping for Herdr Deck
+
+import { DEFAULT_THEME } from "./theme.ts";
 
 const ESC = "\x1b[";
-
-function fgHex(r: number, g: number, b: number): string {
-  return `${ESC}38;2;${r};${g};${b}m`;
-}
-
-function bgHex(r: number, g: number, b: number): string {
-  return `${ESC}48;2;${r};${g};${b}m`;
-}
 
 export const RESET = `${ESC}0m`;
 export const BOLD = `${ESC}1m`;
 export const DIM = `${ESC}2m`;
 
-export const GRUVBOX = {
-  // Foregrounds
-  fg0: fgHex(251, 241, 199), // #fbf1c7 cream bright
-  fg1: fgHex(235, 219, 178), // #ebdbb2 warm main text
-  fg2: fgHex(213, 196, 161), // #d5c4a1 secondary text
-  fg3: fgHex(189, 174, 147), // #bdae93 muted
-  gray: fgHex(146, 131, 116), // #928374 comment gray
-  darkGray: fgHex(102, 92, 84), // #665c54 border dim
-
-  // Accents
-  red: fgHex(251, 73, 52), // #fb4934 blocked urgent
-  orange: fgHex(254, 128, 25), // #fe8019 needs attention / active frame
-  yellow: fgHex(250, 189, 47), // #fabd2f working / warm highlight
-  green: fgHex(184, 187, 38), // #b8bb26 done / ready for review
-  aqua: fgHex(142, 192, 124), // #8ec07c branch / path
-  blue: fgHex(131, 165, 152), // #83a598 info / workspace
-  purple: fgHex(211, 134, 155), // #d3869b accent name color
-
-  // Backgrounds
-  bg0Hard: bgHex(29, 32, 33), // #1d2021
-  bg0: bgHex(40, 40, 40), // #282828
-  bg1: bgHex(60, 56, 54), // #3c3836 selected row / header bar
-  bg2: bgHex(80, 73, 69), // #504945 active badge / input bar
-  bgUrgent: bgHex(76, 36, 32), // subtle warm dark red tint for selected blocked row
-  bgModal: bgHex(34, 34, 34), // #222222 overlay modal card surface
-} as const;
-
-const NAME_PALETTE = [
-  GRUVBOX.blue,
-  GRUVBOX.aqua,
-  GRUVBOX.purple,
-  GRUVBOX.yellow,
-  GRUVBOX.green,
-  GRUVBOX.orange,
-] as const;
-
 /**
- * Deterministic FNV-1a hash mapping an agent/pane title to a readable Gruvbox accent color.
+ * Deterministic FNV-1a hash mapping an agent/pane title to a readable accent color from the active theme palette.
  */
-export function pickNameColor(name: string): string {
+export function pickNameColor(
+  name: string,
+  palette: readonly string[] = DEFAULT_THEME.namePalette,
+  fallbackColor?: string,
+): string {
   const normalized = name.trim().toLowerCase();
-  if (!normalized) return GRUVBOX.fg1;
+  if (!normalized) {
+    return fallbackColor ?? palette[0] ?? DEFAULT_THEME.fgPrimary;
+  }
+  if (palette.length === 0) {
+    return fallbackColor ?? DEFAULT_THEME.fgPrimary;
+  }
   let hash = 2166136261;
   for (let i = 0; i < normalized.length; i++) {
     hash ^= normalized.charCodeAt(i);
     hash = Math.imul(hash, 16777619);
   }
-  const idx = (hash >>> 0) % NAME_PALETTE.length;
-  return NAME_PALETTE[idx]!;
+  const idx = (hash >>> 0) % palette.length;
+  return palette[idx]!;
 }
 
 /**
@@ -74,9 +41,12 @@ export function renderBoxTop(
   width: number,
   borderColor: string,
   bg = "",
+  ellipsisColor?: string,
 ): string {
   if (width < 4) {
-    return fitAnsiColumns("╭" + "─".repeat(Math.max(0, width - 2)) + "╮", width);
+    return fitAnsiColumns("╭" + "─".repeat(Math.max(0, width - 2)) + "╮", width, {
+      ellipsis: "",
+    });
   }
   const innerBudget = width - 2; // exclude ╭ and ╮
   const leftText = title ? `─ ${title} ` : "";
@@ -98,7 +68,11 @@ export function renderBoxTop(
 
   if (title) {
     const maxTitleCols = Math.max(1, innerBudget - 4);
-    const fittedTitle = fitAnsiColumns(title, maxTitleCols, { ellipsis: "…" });
+    const fittedTitle = fitAnsiColumns(title, maxTitleCols, {
+      ellipsis: "…",
+      padBg: bg || undefined,
+      ellipsisColor,
+    });
     const usedTitleW = visibleWidth(fittedTitle);
     const fillCount = Math.max(0, innerBudget - usedTitleW - 3);
     return (
@@ -121,10 +95,15 @@ export function renderBoxRow(
   width: number,
   borderColor: string,
   padBg?: string,
+  ellipsisColor?: string,
 ): string {
   if (width < 2) return "";
   const innerWidth = width - 2;
-  const fitted = fitAnsiColumns(innerContent, innerWidth, { pad: true, padBg });
+  const fitted = fitAnsiColumns(innerContent, innerWidth, {
+    pad: true,
+    padBg,
+    ellipsisColor,
+  });
   const bg = padBg ?? "";
   return `${bg}${borderColor}│${RESET}${fitted}${bg}${borderColor}│${RESET}`;
 }
@@ -215,6 +194,13 @@ export function sanitizePreviewAnsiLine(rawLine: string): string {
   });
 }
 
+export interface FitAnsiColumnsOptions {
+  pad?: boolean;
+  ellipsis?: string;
+  padBg?: string;
+  ellipsisColor?: string;
+}
+
 /**
  * Truncate a string (possibly containing ANSI SGR sequences) to fit `maxCols` display columns,
  * optionally appending an ellipsis and always resetting trailing SGR when ANSI was used.
@@ -222,10 +208,15 @@ export function sanitizePreviewAnsiLine(rawLine: string): string {
 export function fitAnsiColumns(
   input: string,
   maxCols: number,
-  options: { pad?: boolean; ellipsis?: string; padBg?: string } = {},
+  optionsOrEllipsisColor: FitAnsiColumnsOptions | string = {},
 ): string {
   if (maxCols <= 0) return "";
+  const options: FitAnsiColumnsOptions =
+    typeof optionsOrEllipsisColor === "string"
+      ? { ellipsisColor: optionsOrEllipsisColor }
+      : optionsOrEllipsisColor;
   const ellipsis = options.ellipsis ?? "…";
+  const ellipsisColor = options.ellipsisColor ?? DEFAULT_THEME.fgMuted;
   const ellipsisWidth = visibleWidth(ellipsis);
 
   const totalWidth = visibleWidth(input);
@@ -280,7 +271,8 @@ export function fitAnsiColumns(
   }
 
   if (ellipsisWidth > 0 && ellipsisWidth <= maxCols && used + ellipsisWidth <= maxCols) {
-    out += (sawAnsi ? `${RESET}${GRUVBOX.gray}` : "") + ellipsis;
+    const bgPrefix = options.padBg ?? "";
+    out += (sawAnsi ? `${RESET}${bgPrefix}${ellipsisColor}` : "") + ellipsis;
     used += ellipsisWidth;
     sawAnsi = true;
   }
