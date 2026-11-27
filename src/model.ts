@@ -8,15 +8,40 @@ import type {
   PaneInfo,
   PersistedDeckState,
   SessionSnapshot,
+  SleepReason,
   TabInfo,
   WorkspaceInfo,
 } from "./types.ts";
+
+export const DEFAULT_SLEEP_AFTER_HOURS = 24;
+
+export function resolveSleepAfterMs(
+  rawEnv: string | NodeJS.ProcessEnv | undefined = process.env.HERDR_DECK_SLEEP_AFTER_HOURS,
+): number {
+  const rawValue =
+    typeof rawEnv === "object" && rawEnv !== null
+      ? rawEnv.HERDR_DECK_SLEEP_AFTER_HOURS
+      : rawEnv;
+  const raw = rawValue?.trim();
+  if (!raw) {
+    return DEFAULT_SLEEP_AFTER_HOURS * 60 * 60 * 1000;
+  }
+  const hours = Number(raw);
+  if (!Number.isFinite(hours)) {
+    return DEFAULT_SLEEP_AFTER_HOURS * 60 * 60 * 1000;
+  }
+  if (hours <= 0) {
+    return 0;
+  }
+  return Math.round(hours * 60 * 60 * 1000);
+}
 
 const GROUP_PRIORITY: Record<AttentionGroup, number> = {
   needs_you: 0,
   review: 1,
   working: 2,
   idle: 3,
+  sleeping: 4,
 };
 
 export function classifyAttentionGroup(effectiveStatus: AgentStatus): AttentionGroup {
@@ -314,6 +339,9 @@ export function sortDeckAgentItems(items: DeckAgentItem[]): DeckAgentItem[] {
     } else if (a.group === "working") {
       // Longest running or most active
       if (a.sinceMs !== b.sinceMs) return a.sinceMs - b.sinceMs;
+    } else if (a.group === "sleeping") {
+      // Most recently active/settled sleeping agent first; oldest at the bottom
+      if (b.sinceMs !== a.sinceMs) return b.sinceMs - a.sinceMs;
     }
 
     // Prefer local machine before remote machines within the same priority tie
@@ -336,6 +364,7 @@ export function buildMultiMachineDeckItems(
   state: PersistedDeckState,
   snippetsByKey: ReadonlyMap<string, string> = new Map(),
   nowMs = Date.now(),
+  sleepAfterMs = resolveSleepAfterMs(),
 ): DeckAgentItem[] {
   const items: DeckAgentItem[] = [];
 
@@ -361,12 +390,33 @@ export function buildMultiMachineDeckItems(
 
       const itemKey = makeAgentTimerKey(agent.pane_id, machineId);
       const effectiveStatus = computeEffectiveStatus(agent, state, machineId);
-      const group = classifyAttentionGroup(effectiveStatus);
       const timer = state.timers[itemKey];
       const sinceMs =
         effectiveStatus === "working"
           ? (timer?.workingStartedMs ?? timer?.sinceMs ?? nowMs)
           : (timer?.sinceMs ?? nowMs);
+
+      let group: AttentionGroup = classifyAttentionGroup(effectiveStatus);
+      let sleepReason: "manual" | "auto" | null = null;
+      let sleepingSinceMs: number | null = null;
+      if (effectiveStatus === "idle" || effectiveStatus === "unknown") {
+        if (timer?.sleeping === true) {
+          group = "sleeping";
+          sleepReason = "manual";
+          sleepingSinceMs = timer.sleepingSinceMs ?? sinceMs;
+        } else {
+          const idleBaseMs = Math.max(sinceMs, timer?.wokeAtMs ?? 0);
+          if (sleepAfterMs > 0 && nowMs - idleBaseMs >= sleepAfterMs) {
+            group = "sleeping";
+            sleepReason = "auto";
+            sleepingSinceMs = idleBaseMs + sleepAfterMs;
+          } else {
+            group = "idle";
+            sleepReason = null;
+            sleepingSinceMs = null;
+          }
+        }
+      }
 
       const agentKind = agent.agent ?? pane?.agent ?? "agent";
       const agentDisplayName =
@@ -410,6 +460,8 @@ export function buildMultiMachineDeckItems(
         rawStatus: agent.agent_status,
         effectiveStatus,
         group,
+        sleepReason,
+        sleepingSinceMs,
         sinceMs,
         summary: extractAgentSummary(agent, pane, snippet),
         completionSeq: agent.completion_seq ?? null,
@@ -430,12 +482,14 @@ export function buildDeckAgentItems(
   excludePaneId?: string | null,
   nowMs = Date.now(),
   gitInfoByCwd?: ReadonlyMap<string, GitRepoInfo | null>,
+  sleepAfterMs = resolveSleepAfterMs(),
 ): DeckAgentItem[] {
   return buildMultiMachineDeckItems(
     [{ snapshot, excludePaneId, gitInfoByCwd }],
     state,
     snippetsByPane,
     nowMs,
+    sleepAfterMs,
   );
 }
 

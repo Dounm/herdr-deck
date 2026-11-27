@@ -26,6 +26,7 @@ export interface RenderState {
   focusMode: UiFocusMode;
   filterTab: FilterTab;
   showIdle: boolean;
+  showSleeping?: boolean;
   showHelp: boolean;
   previewText: string;
   replyDraft: string;
@@ -54,10 +55,13 @@ function getGroupMeta(
       return { title: "WORKING", color: theme.statusWorking, badge: "↻" };
     case "idle":
       return { title: "IDLE", color: theme.statusIdle, badge: "○" };
+    case "sleeping":
+      return { title: "SLEEPING", color: theme.fgMuted, badge: "☾" };
   }
 }
 
 export function getVisibleItems(state: RenderState): DeckAgentItem[] {
+  const showSleeping = Boolean(state.showSleeping);
   return state.items.filter((item) => {
     if (state.filterTab === "attention") {
       return item.group === "needs_you" || item.group === "review";
@@ -65,9 +69,12 @@ export function getVisibleItems(state: RenderState): DeckAgentItem[] {
     if (state.filterTab === "working") {
       return item.group === "working" || item.group === "needs_you";
     }
+    if (!showSleeping && item.group === "sleeping") {
+      return false;
+    }
     if (!state.showIdle && item.group === "idle") {
-      const hasNonIdle = state.items.some((x) => x.group !== "idle");
-      return !hasNonIdle;
+      const hasActive = state.items.some((x) => x.group !== "idle" && x.group !== "sleeping");
+      return !hasActive;
     }
     return true;
   });
@@ -172,6 +179,7 @@ function renderTopBar(state: RenderState, cols: number, theme: DeckTheme): strin
     review: 0,
     working: 0,
     idle: 0,
+    sleeping: 0,
   };
   for (const item of state.items) {
     counts[item.group] += 1;
@@ -198,6 +206,12 @@ function renderTopBar(state: RenderState, cols: number, theme: DeckTheme): strin
   badges.push(
     `${theme.bgPill}${theme.fgPillMuted} ○ ${counts.idle} 空闲${state.showIdle ? "" : " (隐藏)"} ${RESET}`,
   );
+
+  if (counts.sleeping > 0) {
+    badges.push(
+      `${theme.bgPill}${theme.fgPillMuted} ☾ ${counts.sleeping}${state.showSleeping ? " 休眠" : ""} ${RESET}`,
+    );
+  }
 
   const filterTag =
     state.filterTab === "all"
@@ -272,9 +286,16 @@ function renderAgentListInner(
   height: number,
   theme: DeckTheme,
 ): string[] {
+  const showSleeping = Boolean(state.showSleeping);
+  const sleepingCount = state.items.filter((x) => x.group === "sleeping").length;
+
   if (visibleItems.length === 0) {
     const emptyLines: string[] = [];
     const mid = Math.floor(height / 2) - 1;
+    const hiddenIdleCount =
+      state.filterTab === "all" && !state.showIdle
+        ? state.items.filter((x) => x.group === "idle").length
+        : 0;
     for (let r = 0; r < height; r++) {
       if (r === mid) {
         emptyLines.push(
@@ -285,10 +306,17 @@ function renderAgentListInner(
           ),
         );
       } else if (r === mid + 1) {
-        const hint =
-          state.items.length > 0
-            ? "  按 [z] 显示空闲或 [f] 切换过滤"
-            : "  在任意 Herdr Pane 启动 Claude / Codex / Agy";
+        let hint: string;
+        if (state.filterTab === "all" && !showSleeping && sleepingCount > 0) {
+          hint =
+            hiddenIdleCount > 0
+              ? `  按 [z] 显示空闲或 [S] 展开 ${sleepingCount} 个休眠 Session`
+              : `  按 [S] 展开 ${sleepingCount} 个休眠 Session`;
+        } else if (state.items.length > 0) {
+          hint = "  按 [z] 显示空闲或 [f] 切换过滤";
+        } else {
+          hint = "  在任意 Herdr Pane 启动 Claude / Codex / Agy";
+        }
         emptyLines.push(
           fitAnsiColumns(style(hint, theme.fgMuted), width, {
             pad: true,
@@ -308,7 +336,7 @@ function renderAgentListInner(
   }
 
   const rows: LogicalRow[] = [];
-  const groupsOrder: AttentionGroup[] = ["needs_you", "review", "working", "idle"];
+  const groupsOrder: AttentionGroup[] = ["needs_you", "review", "working", "idle", "sleeping"];
 
   for (const grp of groupsOrder) {
     const groupItems = visibleItems.filter((x) => x.group === grp);
@@ -335,6 +363,18 @@ function renderAgentListInner(
       rows.push({ text: line1, itemKey: item.itemKey });
       rows.push({ text: line2, itemKey: item.itemKey });
     }
+  }
+
+  if (state.filterTab === "all" && !showSleeping && sleepingCount > 0 && visibleItems.length > 0) {
+    rows.push({ text: " ".repeat(width) });
+    const sleepHintCore = ` ─ ☾ SLEEPING (${sleepingCount}) · [S] 展开 `;
+    const fillLen = Math.max(0, width - visibleWidth(sleepHintCore) - 1);
+    const sleepHintLine =
+      `${theme.fgMuted}${sleepHintCore}${RESET}` +
+      `${theme.borderDefault}${"─".repeat(fillLen)}${RESET}`;
+    rows.push({
+      text: fitAnsiColumns(sleepHintLine, width, { pad: true, ellipsisColor: theme.fgMuted }),
+    });
   }
 
   let selFirstRow = 0;
@@ -470,6 +510,19 @@ function renderAgentCardRows(
     iconColor = theme.statusWorking;
     const timerStr = `↻ ${formatDurationCompact(elapsed)}`;
     rightRendered = `${rowBg}${theme.statusWorking}${timerStr} ${RESET}`;
+    rightCols = visibleWidth(timerStr) + 1;
+  } else if (item.group === "sleeping") {
+    icon = "☾";
+    iconColor = isSelected ? theme.fgOnSelectedMuted : theme.fgMuted;
+    const manualElapsed = Math.max(0, state.nowMs - (item.sleepingSinceMs ?? item.sinceMs));
+    const timerStr =
+      item.sleepReason === "manual"
+        ? manualElapsed < 60_000
+          ? "☾ 手动"
+          : `☾ ${formatSleepAge(manualElapsed)}`
+        : formatSleepAge(elapsed);
+    const ageColor = isSelected ? theme.fgOnSelectedMuted : theme.fgMuted;
+    rightRendered = `${rowBg}${ageColor}${timerStr} ${RESET}`;
     rightCols = visibleWidth(timerStr) + 1;
   } else {
     icon = "○";
@@ -855,6 +908,8 @@ function renderCheatsheetBody(cols: number, height: number, theme: DeckTheme): s
         ["m / Space", "将「待审阅」项标记为已阅并移向下一待办"],
         ["f", "循环切换过滤视图（全部 / 仅待办 / 活跃）"],
         ["z", "展开或隐藏 IDLE 空闲分组"],
+        ["s", "休眠 / 唤醒当前选中项"],
+        ["S (Shift+s)", "展开或折叠 SLEEPING 休眠分组"],
         ["Ctrl+r", "立即手动刷新全量快照"],
         ["?", "打开 / 关闭本快捷键速查表"],
       ],
@@ -983,6 +1038,15 @@ function renderFooterBar(state: RenderState, cols: number, theme: DeckTheme): st
     padBg: barBg || undefined,
     ellipsisColor: theme.fgBarDesc,
   });
+}
+
+function formatSleepAge(elapsedMs: number): string {
+  const totalSec = Math.max(0, Math.floor(elapsedMs / 1000));
+  const mins = Math.floor(totalSec / 60);
+  if (mins < 60) return `${Math.max(1, mins)}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 function shortenHome(p: string): string {

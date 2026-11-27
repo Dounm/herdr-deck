@@ -118,6 +118,11 @@ export interface TimerEntry {
   workingStartedMs?: number;
   seenCompletionSeq?: number;
   seenRevision?: number;
+  sleeping?: boolean;
+  sleepingSinceMs?: number;
+  wokeAtMs?: number;
+  lastStateChangeSeq?: number;
+  lastCompletionSeq?: number;
 }
 
 export interface PersistedDeckState {
@@ -125,7 +130,9 @@ export interface PersistedDeckState {
   timers: Record<string, TimerEntry>;
 }
 
-export type AttentionGroup = "needs_you" | "review" | "working" | "idle";
+export type AttentionGroup = "needs_you" | "review" | "working" | "idle" | "sleeping";
+
+export type SleepReason = "manual" | "auto";
 
 export interface MachineProfile {
   id: string;
@@ -167,6 +174,8 @@ export interface DeckAgentItem {
   rawStatus: AgentStatus;
   effectiveStatus: AgentStatus;
   group: AttentionGroup;
+  sleepReason?: SleepReason | null;
+  sleepingSinceMs?: number | null;
   sinceMs: number;
   summary: string;
   completionSeq?: number | null;

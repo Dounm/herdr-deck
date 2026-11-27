@@ -25,6 +25,8 @@ import {
   reconcileTimersWithSnapshot,
   recordAgentStatusTransition,
   saveDeckState,
+  setAgentSleepingInDeck,
+  wakeAgentInDeck,
 } from "./state.ts";
 import { getThemeSignature, type AppearanceMode, type DeckTheme } from "./theme.ts";
 import type {
@@ -113,6 +115,7 @@ export async function runTuiApp(): Promise<void> {
   let focusMode: UiFocusMode = "list";
   let filterTab: FilterTab = "all";
   let showIdle = true;
+  let showSleeping = false;
   let showHelp = false;
   let previewText = "";
   let replyDraft = "";
@@ -154,6 +157,7 @@ export async function runTuiApp(): Promise<void> {
     focusMode,
     filterTab,
     showIdle,
+    showSleeping,
     showHelp,
     previewText,
     replyDraft,
@@ -833,6 +837,66 @@ export async function runTuiApp(): Promise<void> {
     scheduleRender();
   };
 
+  const toggleSleepSelected = () => {
+    const sel = getSelectedItem();
+    if (!sel) return;
+
+    if (sel.group === "working" || sel.group === "needs_you") {
+      setToast("活跃或阻塞中的 Agent 不可休眠", "warn", 2400);
+      return;
+    }
+
+    if (sel.group === "sleeping") {
+      wakeAgentInDeck(persisted, sel.paneId, Date.now(), sel.machineId);
+      saveDeckState(persisted);
+      rebuildItemsFromSnapshot();
+      const nextVis = getCurrentVisible();
+      if (!nextVis.some((x) => x.itemKey === sel.itemKey)) {
+        selectedItemKey = nextVis[0]?.itemKey ?? null;
+      } else {
+        selectedItemKey = sel.itemKey;
+      }
+      requestSelectedPreview(0);
+      setToast(`已唤醒 ${sel.primaryTitle}`, "ok", 2200);
+      return;
+    }
+
+    const prevVis = getCurrentVisible();
+    const prevIdx = Math.max(
+      0,
+      prevVis.findIndex((x) => x.itemKey === sel.itemKey),
+    );
+    setAgentSleepingInDeck(
+      persisted,
+      {
+        pane_id: sel.paneId,
+        agent_status: sel.rawStatus,
+        completion_seq: sel.completionSeq,
+        state_change_seq: sel.stateChangeSeq,
+        revision: sel.revision,
+      },
+      Date.now(),
+      sel.machineId,
+    );
+    saveDeckState(persisted);
+    rebuildItemsFromSnapshot();
+    const nextVis = getCurrentVisible();
+    if (!nextVis.some((x) => x.itemKey === sel.itemKey)) {
+      selectedItemKey =
+        nextVis.length > 0
+          ? (nextVis[Math.min(prevIdx, nextVis.length - 1)]?.itemKey ?? null)
+          : null;
+      requestSelectedPreview(0);
+    }
+    setToast(
+      showSleeping
+        ? `已休眠 ${sel.primaryTitle}`
+        : `已休眠 ${sel.primaryTitle} · 按 [S] 展开查看`,
+      "ok",
+      2400,
+    );
+  };
+
   const handleListModeKey = async (key: ParsedKey) => {
     if (key.kind === "ctrl" && key.key === "c") {
       await cleanupAndExit(0);
@@ -964,6 +1028,23 @@ export async function runTuiApp(): Promise<void> {
           return;
         case "z":
           showIdle = !showIdle;
+          {
+            const vis = getCurrentVisible();
+            if (!vis.some((x) => x.itemKey === selectedItemKey)) {
+              selectedItemKey = vis[0]?.itemKey ?? null;
+              requestSelectedPreview(0);
+            }
+          }
+          scheduleRender();
+          return;
+        case "s":
+          toggleSleepSelected();
+          return;
+        case "S":
+          showSleeping = !showSleeping;
+          if (showSleeping && filterTab !== "all") {
+            filterTab = "all";
+          }
           {
             const vis = getCurrentVisible();
             if (!vis.some((x) => x.itemKey === selectedItemKey)) {

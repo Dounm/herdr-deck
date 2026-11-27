@@ -17,12 +17,14 @@ import {
   buildDeckAgentItems,
   buildMultiMachineDeckItems,
   collectSnapshotGitCwds,
+  DEFAULT_SLEEP_AFTER_HOURS,
   resolvePrimaryTitle,
+  resolveSleepAfterMs,
   stripAnsi,
   summarizeScreenLines,
 } from "../src/model.ts";
 import { parseMachineListJson, parseSnapshotCliJson } from "../src/remote-client.ts";
-import { renderScreen } from "../src/render.ts";
+import { getVisibleItems, renderScreen } from "../src/render.ts";
 import {
   createEmptyState,
   formatDurationCompact,
@@ -32,8 +34,10 @@ import {
   reconcileTimersWithSnapshot,
   recordAgentStatusTransition,
   saveDeckState,
+  setAgentSleepingInDeck,
+  wakeAgentInDeck,
 } from "../src/state.ts";
-import type { SessionSnapshot } from "../src/types.ts";
+import type { AgentInfo, DeckAgentItem, SessionSnapshot } from "../src/types.ts";
 
 test("attention model orders blocked -> review -> working -> idle, resolves primary titles, and handles Mark Reviewed", () => {
   const now = 1_700_000_000_000;
@@ -607,4 +611,447 @@ test("multi-machine aggregation isolates colliding paneIds, timers, and renders 
   assert.ok(plainAll.includes("@soltokyo"), "expected @soltokyo badge in list and preview header");
   assert.ok(plainAll.includes("远端仅原地操作"), "expected remote-only hint in reply box");
   assert.ok(!plainAll.includes("[Enter] 进终端"), "expected Enter jump hint to be hidden for remote items");
+});
+
+function makeSleepTestSnapshot(agents: Array<{
+  paneId: string;
+  label: string;
+  status: AgentInfo["agent_status"];
+  completionSeq?: number | null;
+  stateChangeSeq?: number;
+  revision?: number;
+}>): SessionSnapshot {
+  return {
+    version: "0.9.5",
+    protocol: 22,
+    workspaces: [
+      {
+        workspace_id: "w1",
+        number: 1,
+        label: "work",
+        focused: true,
+        pane_count: agents.length,
+        tab_count: 1,
+        active_tab_id: "w1:t1",
+        agent_status: "idle",
+      },
+    ],
+    tabs: [
+      {
+        tab_id: "w1:t1",
+        workspace_id: "w1",
+        number: 1,
+        label: "main",
+        focused: true,
+        pane_count: agents.length,
+        agent_status: "idle",
+      },
+    ],
+    panes: agents.map((a, idx) => ({
+      pane_id: a.paneId,
+      terminal_id: `t${idx + 1}`,
+      workspace_id: "w1",
+      tab_id: "w1:t1",
+      focused: idx === 0,
+      revision: a.revision ?? 1,
+      label: a.label,
+      agent_status: a.status,
+    })),
+    agents: agents.map((a, idx) => ({
+      pane_id: a.paneId,
+      terminal_id: `t${idx + 1}`,
+      workspace_id: "w1",
+      tab_id: "w1:t1",
+      focused: idx === 0,
+      revision: a.revision ?? 1,
+      agent: "claude",
+      agent_status: a.status,
+      completion_seq: a.completionSeq ?? null,
+      state_change_seq: a.stateChangeSeq ?? 1,
+    })),
+  };
+}
+
+test("manual sleep/wake handles idle, review (marks seen), wokeAtMs countdown reset, and never swallows active groups", () => {
+  const HOUR = 60 * 60 * 1000;
+  const now = 1_700_100_000_000;
+  const state = createEmptyState();
+
+  const snapshot = makeSleepTestSnapshot([
+    { paneId: "w1:p_idle", label: "idle-app", status: "idle", stateChangeSeq: 2, revision: 2 },
+    { paneId: "w1:p_review", label: "review-app", status: "done", completionSeq: 7, stateChangeSeq: 5, revision: 11 },
+    { paneId: "w1:p_blocked", label: "blocked-app", status: "blocked", stateChangeSeq: 3, revision: 4 },
+    { paneId: "w1:p_unread", label: "unread-done", status: "done", completionSeq: 9, stateChangeSeq: 6, revision: 14 },
+    { paneId: "w1:p_working", label: "working-app", status: "working", stateChangeSeq: 4, revision: 8 },
+  ]);
+
+  // Seed timers: active/blocked/unread even with >48h age and sleeping: true must never be swallowed
+  state.timers["w1:p_idle"] = { status: "idle", sinceMs: now - 30 * 60 * 1000 };
+  state.timers["w1:p_review"] = { status: "done", sinceMs: now - 5 * 60 * 1000 };
+  state.timers["w1:p_blocked"] = { status: "blocked", sinceMs: now - 48 * HOUR, sleeping: true, sleepingSinceMs: now - 10 * HOUR };
+  state.timers["w1:p_unread"] = { status: "done", sinceMs: now - 48 * HOUR, sleeping: true, sleepingSinceMs: now - 10 * HOUR };
+  state.timers["w1:p_working"] = { status: "working", sinceMs: now - 48 * HOUR, workingStartedMs: now - 48 * HOUR, sleeping: true };
+
+  // 1) Manual sleep on idle -> sleeping with sleepReason === "manual"
+  setAgentSleepingInDeck(state, snapshot.agents[0]!, now);
+  assert.equal(state.timers["w1:p_idle"]!.sleeping, true);
+  assert.equal(state.timers["w1:p_idle"]!.sleepingSinceMs, now);
+
+  // 2) Manual sleep on review (unread done) -> marks seen (seenCompletionSeq & seenRevision) and sleeps
+  setAgentSleepingInDeck(state, snapshot.agents[1]!, now);
+  assert.equal(state.timers["w1:p_review"]!.sleeping, true);
+  assert.equal(state.timers["w1:p_review"]!.seenCompletionSeq, 7);
+  assert.equal(state.timers["w1:p_review"]!.seenRevision, 11);
+
+  const items = buildDeckAgentItems(snapshot, state, new Map(), null, now);
+  const byPane = new Map(items.map((x) => [x.paneId, x]));
+
+  assert.equal(byPane.get("w1:p_idle")!.group, "sleeping");
+  assert.equal(byPane.get("w1:p_idle")!.sleepReason, "manual");
+  assert.equal(byPane.get("w1:p_review")!.group, "sleeping");
+  assert.equal(byPane.get("w1:p_review")!.sleepReason, "manual");
+
+  // 3) blocked / unread done / working are never swallowed by sleeping
+  assert.equal(byPane.get("w1:p_blocked")!.group, "needs_you");
+  assert.equal(byPane.get("w1:p_blocked")!.sleepReason, null);
+  assert.equal(byPane.get("w1:p_unread")!.group, "review");
+  assert.equal(byPane.get("w1:p_unread")!.sleepReason, null);
+  assert.equal(byPane.get("w1:p_working")!.group, "working");
+  assert.equal(byPane.get("w1:p_working")!.sleepReason, null);
+
+  // 4) Wake a sleeping item whose original sinceMs is > 48h ago -> returns to idle, wokeAtMs resets 24h countdown
+  state.timers["w1:p_idle"]!.sinceMs = now - 48 * HOUR;
+  wakeAgentInDeck(state, "w1:p_idle", now);
+  assert.equal(state.timers["w1:p_idle"]!.sleeping, undefined);
+  assert.equal(state.timers["w1:p_idle"]!.sleepingSinceMs, undefined);
+  assert.equal(state.timers["w1:p_idle"]!.wokeAtMs, now);
+
+  const afterWake = buildDeckAgentItems(snapshot, state, new Map(), null, now + 1000);
+  const woken = afterWake.find((x) => x.paneId === "w1:p_idle")!;
+  assert.equal(woken.group, "idle");
+  assert.equal(woken.sleepReason, null);
+
+  // Still idle at 23h59m after wake, then auto-sleeps at >= 24h after wake
+  const beforeThreshold = buildDeckAgentItems(snapshot, state, new Map(), null, now + 24 * HOUR - 60_000);
+  assert.equal(beforeThreshold.find((x) => x.paneId === "w1:p_idle")!.group, "idle");
+  const atThreshold = buildDeckAgentItems(snapshot, state, new Map(), null, now + 24 * HOUR);
+  assert.equal(atThreshold.find((x) => x.paneId === "w1:p_idle")!.group, "sleeping");
+  assert.equal(atThreshold.find((x) => x.paneId === "w1:p_idle")!.sleepReason, "auto");
+});
+
+test("24h auto-sleep threshold and HERDR_DECK_SLEEP_AFTER_HOURS env override", () => {
+  const HOUR = 60 * 60 * 1000;
+  const MIN = 60 * 1000;
+  assert.equal(DEFAULT_SLEEP_AFTER_HOURS, 24);
+  assert.equal(resolveSleepAfterMs({}), 24 * HOUR);
+  assert.equal(resolveSleepAfterMs({ HERDR_DECK_SLEEP_AFTER_HOURS: "" }), 24 * HOUR);
+  assert.equal(resolveSleepAfterMs({ HERDR_DECK_SLEEP_AFTER_HOURS: "not-a-number" }), 24 * HOUR);
+  assert.equal(resolveSleepAfterMs({ HERDR_DECK_SLEEP_AFTER_HOURS: "0.5" }), 30 * MIN);
+  assert.equal(resolveSleepAfterMs({ HERDR_DECK_SLEEP_AFTER_HOURS: "0" }), 0);
+  assert.equal(resolveSleepAfterMs({ HERDR_DECK_SLEEP_AFTER_HOURS: "-4" }), 0);
+
+  const now = 1_700_200_000_000;
+  const snap = makeSleepTestSnapshot([
+    { paneId: "w1:p_almost", label: "almost-24h", status: "idle" },
+    { paneId: "w1:p_over", label: "over-24h", status: "idle" },
+    { paneId: "w1:p_manual", label: "manual-sleep", status: "idle" },
+  ]);
+  const state = createEmptyState();
+  state.timers["w1:p_almost"] = { status: "idle", sinceMs: now - (24 * HOUR - MIN) }; // 23h59m
+  state.timers["w1:p_over"] = { status: "idle", sinceMs: now - 24 * HOUR }; // exactly 24h
+  state.timers["w1:p_manual"] = { status: "idle", sinceMs: now - 5 * MIN, sleeping: true, sleepingSinceMs: now - 2 * MIN };
+
+  // Default 24h threshold
+  const defaultItems = buildDeckAgentItems(snap, state, new Map(), null, now, undefined, resolveSleepAfterMs({}));
+  const defByPane = new Map(defaultItems.map((x) => [x.paneId, x]));
+  assert.equal(defByPane.get("w1:p_almost")!.group, "idle");
+  assert.equal(defByPane.get("w1:p_almost")!.sleepReason, null);
+  assert.equal(defByPane.get("w1:p_over")!.group, "sleeping");
+  assert.equal(defByPane.get("w1:p_over")!.sleepReason, "auto");
+  assert.equal(defByPane.get("w1:p_manual")!.group, "sleeping");
+  assert.equal(defByPane.get("w1:p_manual")!.sleepReason, "manual");
+
+  // Fractional override (0.5h = 30m): both 23h59m and 24h auto-sleep
+  const halfHourMs = resolveSleepAfterMs({ HERDR_DECK_SLEEP_AFTER_HOURS: "0.5" });
+  const halfHourItems = buildDeckAgentItems(snap, state, new Map(), null, now, undefined, halfHourMs);
+  assert.equal(halfHourItems.find((x) => x.paneId === "w1:p_almost")!.group, "sleeping");
+  assert.equal(halfHourItems.find((x) => x.paneId === "w1:p_almost")!.sleepReason, "auto");
+
+  // Disabled (0): even 24h+ stays idle, while manual sleeping still sleeps
+  const disabledItems = buildDeckAgentItems(snap, state, new Map(), null, now, undefined, resolveSleepAfterMs({ HERDR_DECK_SLEEP_AFTER_HOURS: "0" }));
+  assert.equal(disabledItems.find((x) => x.paneId === "w1:p_over")!.group, "idle");
+  assert.equal(disabledItems.find((x) => x.paneId === "w1:p_over")!.sleepReason, null);
+  assert.equal(disabledItems.find((x) => x.paneId === "w1:p_manual")!.group, "sleeping");
+  assert.equal(disabledItems.find((x) => x.paneId === "w1:p_manual")!.sleepReason, "manual");
+});
+
+test("5-tier group priority and descending sinceMs ordering inside sleeping group", () => {
+  const HOUR = 60 * 60 * 1000;
+  const now = 1_700_300_000_000;
+  const snap = makeSleepTestSnapshot([
+    { paneId: "w1:p_sleep_old", label: "sleep-oldest", status: "idle" },
+    { paneId: "w1:p_idle", label: "hot-idle", status: "idle" },
+    { paneId: "w1:p_sleep_mid", label: "sleep-mid", status: "idle" },
+    { paneId: "w1:p_working", label: "working-one", status: "working" },
+    { paneId: "w1:p_review", label: "review-one", status: "done", completionSeq: 2 },
+    { paneId: "w1:p_blocked", label: "blocked-one", status: "blocked" },
+    { paneId: "w1:p_sleep_new", label: "sleep-newest", status: "idle" },
+  ]);
+
+  const state = createEmptyState();
+  state.timers["w1:p_blocked"] = { status: "blocked", sinceMs: now - 10_000 };
+  state.timers["w1:p_review"] = { status: "done", sinceMs: now - 20_000 };
+  state.timers["w1:p_working"] = { status: "working", sinceMs: now - 30_000, workingStartedMs: now - 30_000 };
+  state.timers["w1:p_idle"] = { status: "idle", sinceMs: now - 40_000 };
+  state.timers["w1:p_sleep_old"] = { status: "idle", sinceMs: now - 96 * HOUR };
+  state.timers["w1:p_sleep_mid"] = { status: "idle", sinceMs: now - 36 * HOUR };
+  state.timers["w1:p_sleep_new"] = { status: "idle", sinceMs: now - 2 * HOUR, sleeping: true, sleepingSinceMs: now - 1000 };
+
+  const items = buildDeckAgentItems(snap, state, new Map(), null, now);
+  assert.deepEqual(
+    items.map((x) => [x.paneId, x.group]),
+    [
+      ["w1:p_blocked", "needs_you"],
+      ["w1:p_review", "review"],
+      ["w1:p_working", "working"],
+      ["w1:p_idle", "idle"],
+      ["w1:p_sleep_new", "sleeping"],
+      ["w1:p_sleep_mid", "sleeping"],
+      ["w1:p_sleep_old", "sleeping"],
+    ],
+  );
+});
+
+test("wake rules: markAgentSeenInDeck does not wake, working transition wakes, and remote reconcile handles seq advancement without migration false-wake", () => {
+  const HOUR = 60 * 60 * 1000;
+  const now = 1_700_400_000_000;
+  const state = createEmptyState();
+
+  // 1) markAgentSeenInDeck does NOT clear sleeping and does NOT update wokeAtMs
+  state.timers["w1:p1"] = {
+    status: "done",
+    sinceMs: now - 30 * HOUR,
+    sleeping: true,
+    sleepingSinceMs: now - 5 * HOUR,
+    wokeAtMs: now - 40 * HOUR,
+  };
+  markAgentSeenInDeck(
+    state,
+    { pane_id: "w1:p1", agent_status: "done", completion_seq: 3, revision: 12 },
+    now,
+  );
+  assert.equal(state.timers["w1:p1"]!.sleeping, true);
+  assert.equal(state.timers["w1:p1"]!.sleepingSinceMs, now - 5 * HOUR);
+  assert.equal(state.timers["w1:p1"]!.wokeAtMs, now - 40 * HOUR);
+
+  // 2) Non-working status transition preserves sleeping & wokeAtMs
+  recordAgentStatusTransition(state, "w1:p1", "idle", now + 1000);
+  assert.equal(state.timers["w1:p1"]!.sleeping, true);
+  assert.equal(state.timers["w1:p1"]!.wokeAtMs, now - 40 * HOUR);
+
+  // 3) recordAgentStatusTransition(..., "working") clears sleeping/sleepingSinceMs and refreshes wokeAtMs
+  recordAgentStatusTransition(state, "w1:p1", "working", now + 2000);
+  assert.equal(state.timers["w1:p1"]!.sleeping, undefined);
+  assert.equal(state.timers["w1:p1"]!.sleepingSinceMs, undefined);
+  assert.equal(state.timers["w1:p1"]!.wokeAtMs, now + 2000);
+
+  // Same-status working transition when sleeping was somehow set still clears sleeping & updates wokeAtMs
+  state.timers["w1:p1"]!.sleeping = true;
+  state.timers["w1:p1"]!.sleepingSinceMs = now + 2500;
+  recordAgentStatusTransition(state, "w1:p1", "working", now + 3000);
+  assert.equal(state.timers["w1:p1"]!.sleeping, undefined);
+  assert.equal(state.timers["w1:p1"]!.sleepingSinceMs, undefined);
+  assert.equal(state.timers["w1:p1"]!.wokeAtMs, now + 3000);
+
+  // 4) Remote SSH machine reconcile: migration backfill does NOT false-wake
+  const remoteKey = makeAgentTimerKey("w1:p_remote", "m-tokyo");
+  state.timers[remoteKey] = {
+    status: "idle",
+    sinceMs: now - 30 * HOUR,
+    sleeping: true,
+    sleepingSinceMs: now - 10 * HOUR,
+    // Old deck-state.json has no lastStateChangeSeq / lastCompletionSeq
+  };
+
+  const snapInitial = makeSleepTestSnapshot([
+    { paneId: "w1:p_remote", label: "remote-box", status: "idle", stateChangeSeq: 10, completionSeq: 4, revision: 20 },
+  ]);
+  reconcileTimersWithSnapshot(state, snapInitial, now, "m-tokyo");
+  assert.equal(state.timers[remoteKey]!.sleeping, true, "backfilling seqs on migration must not wake sleeping agent");
+  assert.equal(state.timers[remoteKey]!.lastStateChangeSeq, 10);
+  assert.equal(state.timers[remoteKey]!.lastCompletionSeq, 4);
+
+  // 5) Remote state_change_seq advances -> auto-wakes & updates baseline
+  const snapStateSeqAdvanced = makeSleepTestSnapshot([
+    { paneId: "w1:p_remote", label: "remote-box", status: "idle", stateChangeSeq: 11, completionSeq: 4, revision: 21 },
+  ]);
+  reconcileTimersWithSnapshot(state, snapStateSeqAdvanced, now + 5000, "m-tokyo");
+  assert.equal(state.timers[remoteKey]!.sleeping, undefined);
+  assert.equal(state.timers[remoteKey]!.sleepingSinceMs, undefined);
+  assert.equal(state.timers[remoteKey]!.wokeAtMs, now + 5000);
+  assert.equal(state.timers[remoteKey]!.lastStateChangeSeq, 11);
+
+  // 6) Remote completion_seq advances -> auto-wakes & updates baseline
+  state.timers[remoteKey]!.sleeping = true;
+  state.timers[remoteKey]!.sleepingSinceMs = now + 6000;
+  const snapCompSeqAdvanced = makeSleepTestSnapshot([
+    { paneId: "w1:p_remote", label: "remote-box", status: "idle", stateChangeSeq: 11, completionSeq: 5, revision: 22 },
+  ]);
+  reconcileTimersWithSnapshot(state, snapCompSeqAdvanced, now + 10_000, "m-tokyo");
+  assert.equal(state.timers[remoteKey]!.sleeping, undefined);
+  assert.equal(state.timers[remoteKey]!.wokeAtMs, now + 10_000);
+  assert.equal(state.timers[remoteKey]!.lastCompletionSeq, 5);
+
+  // 7) Remote agent_status === "working" -> auto-wakes
+  state.timers[remoteKey]!.sleeping = true;
+  state.timers[remoteKey]!.sleepingSinceMs = now + 11_000;
+  const snapWorking = makeSleepTestSnapshot([
+    { paneId: "w1:p_remote", label: "remote-box", status: "working", stateChangeSeq: 11, completionSeq: 5, revision: 23 },
+  ]);
+  reconcileTimersWithSnapshot(state, snapWorking, now + 15_000, "m-tokyo");
+  assert.equal(state.timers[remoteKey]!.sleeping, undefined);
+  assert.equal(state.timers[remoteKey]!.wokeAtMs, now + 15_000);
+});
+
+test("renderScreen & getVisibleItems handle collapsed/expanded SLEEPING group, top bar badge, empty state, and cheatsheet", () => {
+  const HOUR = 60 * 60 * 1000;
+  const now = 1_700_500_000_000;
+  const cols = 112;
+  const rows = 26;
+
+  const hotIdleItem: DeckAgentItem = {
+    itemKey: "w1:p1",
+    machineId: null,
+    machineLabel: null,
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    workspaceLabel: "misc",
+    workspaceNumber: 1,
+    tabLabel: "main",
+    paneLabel: "hot-agent",
+    primaryTitle: "hot-agent",
+    branch: "main",
+    cwd: "/repo/hot",
+    agentKind: "claude",
+    agentDisplayName: "claude",
+    rawStatus: "idle",
+    effectiveStatus: "idle",
+    group: "idle",
+    sleepReason: null,
+    sinceMs: now - 5 * 60 * 1000,
+    summary: "Idle at prompt",
+    completionSeq: null,
+    stateChangeSeq: 1,
+    revision: 1,
+    focusedInHerdr: true,
+  };
+
+  const sleepingManualItem: DeckAgentItem = {
+    ...hotIdleItem,
+    itemKey: "w1:p2",
+    paneId: "w1:p2",
+    paneLabel: "manual-sleeper",
+    primaryTitle: "manual-sleeper",
+    group: "sleeping",
+    sleepReason: "manual",
+    sinceMs: now - 10 * 60 * 1000,
+    focusedInHerdr: false,
+  };
+
+  const sleepingAutoItem: DeckAgentItem = {
+    ...hotIdleItem,
+    itemKey: "w1:p3",
+    paneId: "w1:p3",
+    paneLabel: "auto-sleeper",
+    primaryTitle: "auto-sleeper",
+    group: "sleeping",
+    sleepReason: "auto",
+    sinceMs: now - 72 * HOUR,
+    focusedInHerdr: false,
+  };
+
+  const extractRows = (frame: string): string[] =>
+    [...frame.matchAll(/\x1b\[(\d+);1H([\s\S]*?)\x1b\[K/g)].map((m) => stripAnsi(m[2]!));
+
+  const baseRenderState = {
+    cols,
+    rows,
+    items: [hotIdleItem, sleepingManualItem, sleepingAutoItem],
+    selectedItemKey: "w1:p1",
+    focusMode: "list" as const,
+    filterTab: "all" as const,
+    showIdle: true,
+    showSleeping: false,
+    showHelp: false,
+    previewText: "Ready.",
+    replyDraft: "",
+    replyCursor: 0,
+    renameDraft: "",
+    renameCursor: 0,
+    toastMessage: null,
+    toastKind: "info" as const,
+    spinnerTick: 0,
+    nowMs: now,
+  };
+
+  // 1) Collapsed by default (showSleeping = false): hides sleeping items, top bar counts only hot idle + shows ☾ 2 badge, bottom shows fold hint
+  assert.deepEqual(
+    getVisibleItems(baseRenderState).map((x) => x.itemKey),
+    ["w1:p1"],
+  );
+  const collapsedFrame = renderScreen(baseRenderState);
+  const collapsedLines = extractRows(collapsedFrame);
+  assert.equal(collapsedLines.length, rows);
+  for (const [idx, line] of collapsedLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `collapsed row ${idx} width mismatch: "${line}"`);
+  }
+  const collapsedText = collapsedLines.join("\n");
+  assert.ok(collapsedText.includes("○ 1 空闲"), "top bar should count only hot idle");
+  assert.ok(collapsedText.includes("☾ 2"), "top bar should show muted sleeping badge");
+  assert.ok(collapsedText.includes("SLEEPING (2) · [S] 展开"), "bottom should show collapsed sleeping hint");
+  assert.ok(!collapsedText.includes("manual-sleeper"), "sleeping cards should be hidden when collapsed");
+
+  // 2) Only sleeping items exist + showSleeping = false -> empty state hint
+  const onlySleepingState = {
+    ...baseRenderState,
+    items: [sleepingManualItem, sleepingAutoItem],
+    selectedItemKey: null,
+  };
+  assert.deepEqual(getVisibleItems(onlySleepingState), []);
+  const emptyFrame = renderScreen(onlySleepingState);
+  const emptyLines = extractRows(emptyFrame);
+  assert.equal(emptyLines.length, rows);
+  for (const [idx, line] of emptyLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `empty-sleeping row ${idx} width mismatch: "${line}"`);
+  }
+  assert.ok(emptyLines.join("\n").includes("按 [S] 展开 2 个休眠 Session"));
+
+  // 3) Expanded (showSleeping = true): renders ☾ SLEEPING (2) group header and sleeping cards
+  const expandedState = { ...baseRenderState, showSleeping: true };
+  assert.deepEqual(
+    getVisibleItems(expandedState).map((x) => x.itemKey),
+    ["w1:p1", "w1:p2", "w1:p3"],
+  );
+  const expandedFrame = renderScreen(expandedState);
+  const expandedLines = extractRows(expandedFrame);
+  assert.equal(expandedLines.length, rows);
+  for (const [idx, line] of expandedLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `expanded row ${idx} width mismatch: "${line}"`);
+  }
+  const expandedText = expandedLines.join("\n");
+  assert.ok(expandedText.includes("☾ SLEEPING (2)"), "expanded view should render SLEEPING group header");
+  assert.ok(expandedText.includes("manual-sleeper"), "expanded view should render manual sleeping card");
+  assert.ok(expandedText.includes("auto-sleeper"), "expanded view should render auto sleeping card");
+
+  // 4) Cheatsheet includes s and S shortcuts
+  const helpFrame = renderScreen({ ...baseRenderState, showHelp: true });
+  const helpLines = extractRows(helpFrame);
+  assert.equal(helpLines.length, rows);
+  for (const [idx, line] of helpLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `help row ${idx} width mismatch: "${line}"`);
+  }
+  const helpText = helpLines.join("\n");
+  assert.ok(helpText.includes("休眠 / 唤醒"), "cheatsheet should document s shortcut");
+  assert.ok(helpText.includes("SLEEPING"), "cheatsheet should document S shortcut");
 });

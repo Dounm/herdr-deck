@@ -34,11 +34,12 @@
 
 ## 核心特性
 
-- **注意力四级分诊队列（Attention Hierarchy）**：
+- **注意力五级分诊队列（Attention Hierarchy）**：
   - **`! NEEDS YOU`**：处于 `blocked` 阻塞审批或提问的 Agent，置顶高亮并显示已等待时长 `⚑ mm:ss`，自动从屏幕底部提取卡点摘要。
   - **`✓ READY FOR REVIEW`**：刚完成任务等待检阅（`done`），在右侧看完结果后按 `m` / `Space` 即可原地标记已阅（无需切进终端）。
   - **`↻ WORKING`**：后台推进中的 Agent，通过插件事件钩子精准记录并跳动**本轮 Working 耗时 `↻ mm:ss`**。
   - **`○ IDLE`**：空闲待命的 Agent（支持按 `z` 一键隐藏/展开）。
+  - **`☾ SLEEPING`**：冷休眠分组，收纳长期闲置或手动置入的 Session。支持按 `s` 手动休眠 / 唤醒（仅空闲或待审阅项），并默认在静置 **24 小时**后自动沉降（可通过环境变量 `HERDR_DECK_SLEEP_AFTER_HOURS` 覆盖小时数，设为 `0` 禁用自动沉降）；仅在 Agent 重新进入 `working` 时自动唤醒；每次呼出默认折叠，按 `S`（`Shift+s`）随时展开或折叠。
 - **高辨识度命名 + 稳定哈希分色**：
   - 优先展示 `pane.label`（忽略纯数字），缺失时回退为 `agent.name` / 目录末段名 / `workspace` 名，并为不同名称分配稳定的 Gruvbox 亮色，同一 Workspace 下开多个 Agent 也能一眼分辨。
 - **多机器（SSH Machines）聚合控制**：
@@ -92,6 +93,12 @@ herdr server reload-config
 
 之后在任意 Workspace / Tab 按 **`prefix + i`** 即可呼出 Herdr Deck 弹窗。
 
+### 3. 环境变量（可选）
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HERDR_DECK_SLEEP_AFTER_HOURS` | `24` | 空闲 Session 自动沉降到 `☾ SLEEPING` 分组的小时数，支持小数（如 `0.5` 表示 30 分钟）；设为 `0` 或负数时禁用自动沉降（仅保留手动 `s` 休眠）。 |
+
 ---
 
 ## 快捷键速查
@@ -110,6 +117,8 @@ herdr server reload-config
 | | `m` / `Space` | 将「待审阅」项标记为已阅并移向下一待办 |
 | | `f` | 循环切换过滤视图（全部 / 仅待办 / 活跃） |
 | | `z` | 展开或隐藏 `IDLE` 空闲分组 |
+| | `s` | 休眠 / 唤醒当前选中项（仅空闲 / 待审阅） |
+| | `S`（`Shift+s`） | 展开或折叠 `SLEEPING` 休眠分组 |
 | | `Ctrl+r` | 立即手动刷新全量快照 |
 | | `?` | 打开 / 关闭完整快捷键速查表（Cheatsheet） |
 
@@ -149,7 +158,7 @@ herdr-deck/
 │   ├── cli.ts          # 命令行入口（startup / event / action / ui）
 │   ├── socket-client.ts# Herdr Unix Socket RPC & events.subscribe 客户端
 │   ├── state.ts        # Working/Blocked 计时器与已阅状态持久化
-│   ├── model.ts        # 注意力四级排序、主标题解析与屏幕摘要清洗
+│   ├── model.ts        # 注意力五级排序、主标题解析与屏幕摘要清洗
 │   ├── ansi.ts         # Gruvbox 24-bit 配色、宽字符宽度、ANSI 软换行与输入框布局
 │   ├── keys.ts         # 终端原始键盘输入解析（含 UTF-8/CJK 与控制序列）
 │   ├── render.ts       # 圆角三区卡片 TUI、Cheatsheet 浮层与 DEC 2026 同步帧渲染
