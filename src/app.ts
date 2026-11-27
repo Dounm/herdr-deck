@@ -1,3 +1,8 @@
+import {
+  canCloseIdleAgent,
+  closeIdleAgent,
+  resolveSelectionAfterRemoval,
+} from "./close-agent.ts";
 import { refreshGitInfoForCwds, type GitCacheEntry } from "./git.ts";
 import {
   buildOsc11Query,
@@ -75,6 +80,7 @@ const REMOTE_SNAPSHOT_INTERVAL_MS = 4500;
 const REMOTE_MACHINE_LIST_TTL_MS = 30000;
 const REMOTE_PREVIEW_POLL_INTERVAL_MS = 3600;
 const OSC11_PENDING_TIMEOUT_MS = 120;
+const REMOVAL_ANCHOR_TTL_MS = 8000;
 
 export async function runTuiApp(): Promise<void> {
   const client = new HerdrSocketClient();
@@ -106,6 +112,14 @@ export async function runTuiApp(): Promise<void> {
   const snippetsByKey = new Map<string, string>();
   const previewCache = new Map<string, string>();
   const lastFetchedRevision = new Map<string, number>();
+  const closingItemKeys = new Set<string>();
+  const closeCooldownTimers = new Map<string, NodeJS.Timeout>();
+  const followUpTimers = new Set<NodeJS.Timeout>();
+  let pendingRemovalAnchor: {
+    itemKey: string;
+    prevVisibleKeys: string[];
+    createdAtMs: number;
+  } | null = null;
   const gitCache = new Map<string, GitCacheEntry>();
   const gitInfoByCwd = new Map<string, GitRepoInfo | null>();
   let gitRefreshInFlight = false;
@@ -261,6 +275,34 @@ export async function runTuiApp(): Promise<void> {
       });
     }
     items = buildMultiMachineDeckItems(sources, persisted, snippetsByKey, Date.now());
+  };
+
+  const pruneStaleItemCaches = () => {
+    const activeKeys = new Set(items.map((x) => x.itemKey));
+    for (const key of previewCache.keys()) {
+      if (!activeKeys.has(key)) previewCache.delete(key);
+    }
+    for (const key of snippetsByKey.keys()) {
+      if (!activeKeys.has(key)) snippetsByKey.delete(key);
+    }
+    for (const key of lastFetchedRevision.keys()) {
+      if (!activeKeys.has(key)) lastFetchedRevision.delete(key);
+    }
+  };
+
+  const scheduleFollowUp = (delayMs: number, fn: () => void): NodeJS.Timeout => {
+    const timer = setTimeout(() => {
+      followUpTimers.delete(timer);
+      if (!exiting) {
+        fn();
+      }
+    }, delayMs);
+    followUpTimers.add(timer);
+    return timer;
+  };
+
+  const clearPendingRemovalAnchor = () => {
+    pendingRemovalAnchor = null;
   };
 
   const triggerGitRefresh = (force = false) => {
@@ -422,16 +464,13 @@ export async function runTuiApp(): Promise<void> {
         return;
       }
 
-      let stateDirty = false;
+      const fetchedSnapshots: Array<{ machineId: string; snapshot: SessionSnapshot }> = [];
       await Promise.all(
         remoteMachines.map(async (machine) => {
           try {
             const rSnap = await remoteClient.getSnapshot(machine.id);
             if (exiting) return;
-            remoteSnapshots.set(machine.id, rSnap);
-            if (reconcileTimersWithSnapshot(persisted, rSnap, Date.now(), machine.id)) {
-              stateDirty = true;
-            }
+            fetchedSnapshots.push({ machineId: machine.id, snapshot: rSnap });
             await refreshSnippetsForPriorityAgents(rSnap, machine.id);
           } catch {
             // Machine might be temporarily unreachable; keep last known snapshot or skip silently
@@ -440,19 +479,53 @@ export async function runTuiApp(): Promise<void> {
       );
 
       if (exiting) return;
+
+      persisted = loadDeckState();
+      let stateDirty = false;
+      const reconcileNowMs = Date.now();
+      for (const { machineId, snapshot: rSnap } of fetchedSnapshots) {
+        remoteSnapshots.set(machineId, rSnap);
+        if (reconcileTimersWithSnapshot(persisted, rSnap, reconcileNowMs, machineId)) {
+          stateDirty = true;
+        }
+      }
       if (stateDirty) {
         saveDeckState(persisted);
       }
 
+      if (
+        pendingRemovalAnchor &&
+        reconcileNowMs - pendingRemovalAnchor.createdAtMs > REMOVAL_ANCHOR_TTL_MS
+      ) {
+        pendingRemovalAnchor = null;
+      }
+
       const prevSelectedKey = selectedItemKey;
       rebuildItemsFromSnapshot();
+      pruneStaleItemCaches();
       const vis = getCurrentVisible();
-      if (!selectedItemKey || !vis.some((x) => x.itemKey === selectedItemKey)) {
+      const nextVisibleKeys = vis.map((x) => x.itemKey);
+      if (
+        pendingRemovalAnchor &&
+        selectedItemKey === pendingRemovalAnchor.itemKey &&
+        !nextVisibleKeys.includes(pendingRemovalAnchor.itemKey)
+      ) {
+        selectedItemKey = resolveSelectionAfterRemoval(
+          pendingRemovalAnchor.prevVisibleKeys,
+          pendingRemovalAnchor.itemKey,
+          nextVisibleKeys,
+        );
+        pendingRemovalAnchor = null;
+      } else if (!selectedItemKey || !vis.some((x) => x.itemKey === selectedItemKey)) {
         selectedItemKey = vis[0]?.itemKey ?? null;
       }
 
+      if (pendingRemovalAnchor && !nextVisibleKeys.includes(pendingRemovalAnchor.itemKey)) {
+        pendingRemovalAnchor = null;
+      }
+
       const sel = getSelectedItem();
-      if (sel && sel.itemKey !== prevSelectedKey) {
+      if (sel?.itemKey !== prevSelectedKey) {
         requestSelectedPreview(0);
       }
       scheduleRender();
@@ -468,31 +541,56 @@ export async function runTuiApp(): Promise<void> {
     }
     refreshInFlight = true;
     try {
-      persisted = loadDeckState();
-
       const snap = await client.getSnapshot();
       snapshot = snap;
       if (!originFocusedPaneId && snap.focused_pane_id) {
         originFocusedPaneId = snap.focused_pane_id;
       }
 
-      const dirty = reconcileTimersWithSnapshot(persisted, snap);
+      await refreshSnippetsForPriorityAgents(snap, null);
+
+      const nowMs = Date.now();
+      persisted = loadDeckState();
+      const dirty = reconcileTimersWithSnapshot(persisted, snap, nowMs);
       if (dirty) {
         saveDeckState(persisted);
       }
 
-      await refreshSnippetsForPriorityAgents(snap, null);
+      if (pendingRemovalAnchor && nowMs - pendingRemovalAnchor.createdAtMs > REMOVAL_ANCHOR_TTL_MS) {
+        pendingRemovalAnchor = null;
+      }
 
+      const prevSelectedKey = selectedItemKey;
       rebuildItemsFromSnapshot();
+      pruneStaleItemCaches();
 
       const vis = getCurrentVisible();
-      if (!preserveSelection || !selectedItemKey || !vis.some((x) => x.itemKey === selectedItemKey)) {
+      const nextVisibleKeys = vis.map((x) => x.itemKey);
+      if (
+        preserveSelection &&
+        pendingRemovalAnchor &&
+        selectedItemKey === pendingRemovalAnchor.itemKey &&
+        !nextVisibleKeys.includes(pendingRemovalAnchor.itemKey)
+      ) {
+        selectedItemKey = resolveSelectionAfterRemoval(
+          pendingRemovalAnchor.prevVisibleKeys,
+          pendingRemovalAnchor.itemKey,
+          nextVisibleKeys,
+        );
+        pendingRemovalAnchor = null;
+      } else if (!preserveSelection || !selectedItemKey || !vis.some((x) => x.itemKey === selectedItemKey)) {
         selectedItemKey = vis[0]?.itemKey ?? null;
+      }
+
+      if (pendingRemovalAnchor && !nextVisibleKeys.includes(pendingRemovalAnchor.itemKey)) {
+        pendingRemovalAnchor = null;
       }
 
       const sel = getSelectedItem();
       if (sel && previewCache.has(sel.itemKey)) {
         previewText = previewCache.get(sel.itemKey)!;
+      } else if (!sel || sel.itemKey !== prevSelectedKey) {
+        previewText = "";
       }
 
       scheduleRender();
@@ -531,6 +629,17 @@ export async function runTuiApp(): Promise<void> {
             recordAgentStatusTransition(persisted, paneId, nextStatus);
             saveDeckState(persisted);
           }
+        } else if (
+          (ev.event === "pane.agent_detected" || ev.event === "pane_agent_detected") &&
+          ev.data.released === true &&
+          typeof ev.data.pane_id === "string"
+        ) {
+          const paneId = ev.data.pane_id;
+          delete persisted.timers[paneId];
+          saveDeckState(persisted);
+          previewCache.delete(paneId);
+          snippetsByKey.delete(paneId);
+          lastFetchedRevision.delete(paneId);
         }
         void refreshSnapshot(true);
       },
@@ -561,6 +670,10 @@ export async function runTuiApp(): Promise<void> {
     if (previewDebounceTimer) clearTimeout(previewDebounceTimer);
     if (previewRefreshTimer) clearInterval(previewRefreshTimer);
     if (toastTimer) clearTimeout(toastTimer);
+    for (const timer of closeCooldownTimers.values()) clearTimeout(timer);
+    closeCooldownTimers.clear();
+    for (const timer of followUpTimers) clearTimeout(timer);
+    followUpTimers.clear();
 
     if (process.stdin.isTTY) {
       try {
@@ -578,6 +691,7 @@ export async function runTuiApp(): Promise<void> {
   };
 
   const selectItemByKey = (nextItemKey: string) => {
+    clearPendingRemovalAnchor();
     if (selectedItemKey === nextItemKey) return;
     selectedItemKey = nextItemKey;
     const cached = previewCache.get(nextItemKey);
@@ -674,7 +788,7 @@ export async function runTuiApp(): Promise<void> {
         await client.sendAgentKeys(sel.paneId, [herdrKey]);
       }
       setToast(`已发送 [${label ?? herdrKey}] → ${machineTag}${sel.primaryTitle}`, "ok", 2000);
-      setTimeout(() => {
+      scheduleFollowUp(sel.machineId ? 300 : 140, () => {
         requestSelectedPreview(0);
         const refreshPromise = sel.machineId
           ? refreshRemoteSnapshots(false)
@@ -687,7 +801,7 @@ export async function runTuiApp(): Promise<void> {
             }
           }
         });
-      }, sel.machineId ? 300 : 140);
+      });
     } catch (err) {
       try {
         if (sel.machineId) {
@@ -696,7 +810,9 @@ export async function runTuiApp(): Promise<void> {
           await client.sendPaneKeys(sel.paneId, [herdrKey]);
         }
         setToast(`已发送 [${label ?? herdrKey}] → ${machineTag}${sel.primaryTitle}`, "ok", 2000);
-        setTimeout(() => requestSelectedPreview(0), sel.machineId ? 300 : 140);
+        scheduleFollowUp(sel.machineId ? 300 : 140, () => {
+          requestSelectedPreview(0);
+        });
       } catch (err2) {
         setToast(
           `发送按键失败: ${err2 instanceof Error ? err2.message : String(err)}`,
@@ -738,13 +854,13 @@ export async function runTuiApp(): Promise<void> {
       );
       saveDeckState(persisted);
       setToast(`已发送回复 → ${machineTag}${sel.primaryTitle}`, "ok");
-      setTimeout(() => {
+      scheduleFollowUp(sel.machineId ? 350 : 180, () => {
         if (sel.machineId) {
           void refreshRemoteSnapshots(false);
         } else {
           void refreshSnapshot(true);
         }
-      }, sel.machineId ? 350 : 180);
+      });
     } catch (err) {
       if (
         (err instanceof HerdrRpcError || err instanceof HerdrCliError) &&
@@ -840,6 +956,7 @@ export async function runTuiApp(): Promise<void> {
   const toggleSleepSelected = () => {
     const sel = getSelectedItem();
     if (!sel) return;
+    clearPendingRemovalAnchor();
 
     if (sel.group === "working" || sel.group === "needs_you") {
       setToast("活跃或阻塞中的 Agent 不可休眠", "warn", 2400);
@@ -895,6 +1012,112 @@ export async function runTuiApp(): Promise<void> {
       "ok",
       2400,
     );
+  };
+
+  const closeSelectedIdleAgent = async () => {
+    const sel = getSelectedItem();
+    if (!sel || exiting) return;
+
+    const machineTag = sel.machineLabel ? `@${sel.machineLabel} ` : "";
+
+    if (canCloseIdleAgent(sel) && closeCooldownTimers.has(sel.itemKey)) {
+      setToast(`正在关闭 ${machineTag}${sel.primaryTitle}…`, "info", 1600);
+      return;
+    }
+
+    const prevVisibleKeys = getCurrentVisible().map((x) => x.itemKey);
+    const shouldTrackRemoval = canCloseIdleAgent(sel) && !closingItemKeys.has(sel.itemKey);
+    if (shouldTrackRemoval) {
+      selectedItemKey = sel.itemKey;
+      pendingRemovalAnchor = {
+        itemKey: sel.itemKey,
+        prevVisibleKeys,
+        createdAtMs: Date.now(),
+      };
+    }
+
+    const res = await closeIdleAgent(sel, {
+      closingKeys: closingItemKeys,
+      getAgent: (target) =>
+        target.machineId
+          ? remoteClient.getAgent(target.machineId, target.paneId)
+          : client.getAgent(target.paneId),
+      sendAgentKeys: (target, keys) =>
+        target.machineId
+          ? remoteClient.sendAgentKeys(target.machineId, target.paneId, keys)
+          : client.sendAgentKeys(target.paneId, keys),
+      onSent: (target) => {
+        if (exiting) return;
+        const existingCooldown = closeCooldownTimers.get(target.itemKey);
+        if (existingCooldown) clearTimeout(existingCooldown);
+        const cooldownTimer = setTimeout(() => {
+          closeCooldownTimers.delete(target.itemKey);
+        }, 450);
+        closeCooldownTimers.set(target.itemKey, cooldownTimer);
+      },
+    });
+
+    if (exiting) return;
+
+    const triggerImmediateRefresh = () => {
+      if (sel.machineId) {
+        void refreshRemoteSnapshots(false);
+      } else {
+        void refreshSnapshot(true);
+      }
+    };
+
+    switch (res.outcome) {
+      case "blocked_by_state":
+        if (pendingRemovalAnchor?.itemKey === sel.itemKey) {
+          pendingRemovalAnchor = null;
+        }
+        setToast(res.message, "warn", 2600);
+        return;
+
+      case "in_flight":
+        setToast(`正在关闭 ${machineTag}${sel.primaryTitle}…`, "info", 1600);
+        return;
+
+      case "status_changed":
+        if (pendingRemovalAnchor?.itemKey === sel.itemKey) {
+          pendingRemovalAnchor = null;
+        }
+        setToast(
+          res.liveStatus === "done"
+            ? `${machineTag}${sel.primaryTitle} 刚完成新任务等待审阅，已取消关闭`
+            : `${machineTag}${sel.primaryTitle} 状态已变为运行/待处理，已取消关闭`,
+          "warn",
+          2800,
+        );
+        triggerImmediateRefresh();
+        return;
+
+      case "already_exited":
+        setToast(`${machineTag}${sel.primaryTitle} 已退出`, "info", 2200);
+        triggerImmediateRefresh();
+        return;
+
+      case "sent": {
+        setToast(`已发送退出信号 (Ctrl+D) → ${machineTag}${sel.primaryTitle}`, "ok", 2200);
+
+        const delays = sel.machineId ? [500, 1600] : [250, 900];
+        for (const delay of delays) {
+          scheduleFollowUp(delay, () => {
+            requestSelectedPreview(0);
+            triggerImmediateRefresh();
+          });
+        }
+        return;
+      }
+
+      case "error":
+        if (pendingRemovalAnchor?.itemKey === sel.itemKey) {
+          pendingRemovalAnchor = null;
+        }
+        setToast(`关闭 Agent 失败: ${res.message}`, "error", 3200);
+        return;
+    }
   };
 
   const handleListModeKey = async (key: ParsedKey) => {
@@ -1007,10 +1230,14 @@ export async function runTuiApp(): Promise<void> {
           }
           return;
         }
+        case "X":
+          await closeSelectedIdleAgent();
+          return;
         case "m":
           markSelectedReviewed();
           return;
         case "f":
+          clearPendingRemovalAnchor();
           filterTab =
             filterTab === "all"
               ? "attention"
@@ -1027,6 +1254,7 @@ export async function runTuiApp(): Promise<void> {
           scheduleRender();
           return;
         case "z":
+          clearPendingRemovalAnchor();
           showIdle = !showIdle;
           {
             const vis = getCurrentVisible();
@@ -1041,6 +1269,7 @@ export async function runTuiApp(): Promise<void> {
           toggleSleepSelected();
           return;
         case "S":
+          clearPendingRemovalAnchor();
           showSleeping = !showSleeping;
           if (showSleeping && filterTab !== "all") {
             filterTab = "all";

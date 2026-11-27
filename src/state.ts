@@ -131,7 +131,7 @@ export function reconcileTimersWithSnapshot(
   machineId?: string | null,
 ): boolean {
   let dirty = false;
-  const liveKeys = new Set(snapshot.panes.map((p) => makeAgentTimerKey(p.pane_id, machineId)));
+  const liveKeys = new Set(snapshot.agents.map((a) => makeAgentTimerKey(a.pane_id, machineId)));
   const prefix = machineId ? `${machineId}::` : null;
 
   for (const key of Object.keys(state.timers)) {

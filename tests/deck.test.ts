@@ -11,6 +11,14 @@ import {
   visibleWidth,
   wrapAnsiLine,
 } from "../src/ansi.ts";
+import {
+  CLOSE_AGENT_KEY,
+  canCloseIdleAgent,
+  closeIdleAgent,
+  getCloseAgentBlockedMessage,
+  isAgentNotFoundError,
+  resolveSelectionAfterRemoval,
+} from "../src/close-agent.ts";
 import { parseGitPorcelainV2, refreshGitInfoForCwds, type GitCacheEntry } from "../src/git.ts";
 import { parseTerminalInput, toHerdrKeySpec } from "../src/keys.ts";
 import {
@@ -23,8 +31,15 @@ import {
   stripAnsi,
   summarizeScreenLines,
 } from "../src/model.ts";
-import { parseMachineListJson, parseSnapshotCliJson } from "../src/remote-client.ts";
+import {
+  classifyHerdrCliErrorCode,
+  HerdrCliError,
+  parseAgentGetCliJson,
+  parseMachineListJson,
+  parseSnapshotCliJson,
+} from "../src/remote-client.ts";
 import { getVisibleItems, renderScreen } from "../src/render.ts";
+import { HerdrRpcError, HerdrSocketClient } from "../src/socket-client.ts";
 import {
   createEmptyState,
   formatDurationCompact,
@@ -1054,4 +1069,684 @@ test("renderScreen & getVisibleItems handle collapsed/expanded SLEEPING group, t
   const helpText = helpLines.join("\n");
   assert.ok(helpText.includes("休眠 / 唤醒"), "cheatsheet should document s shortcut");
   assert.ok(helpText.includes("SLEEPING"), "cheatsheet should document S shortcut");
+});
+
+function makeDeckItem(overrides: Partial<DeckAgentItem> = {}): DeckAgentItem {
+  return {
+    itemKey: "w1:p1",
+    machineId: null,
+    machineLabel: null,
+    paneId: "w1:p1",
+    workspaceId: "w1",
+    tabId: "w1:t1",
+    workspaceLabel: "misc",
+    workspaceNumber: 1,
+    tabLabel: "main",
+    paneLabel: "idle-agent",
+    primaryTitle: "idle-agent",
+    branch: "main",
+    cwd: "/repo/misc",
+    agentKind: "claude",
+    agentDisplayName: "claude",
+    rawStatus: "idle",
+    effectiveStatus: "idle",
+    group: "idle",
+    sleepReason: null,
+    sinceMs: 1_000,
+    summary: "Idle at prompt",
+    completionSeq: null,
+    stateChangeSeq: 1,
+    revision: 1,
+    focusedInHerdr: false,
+    ...overrides,
+  };
+}
+
+test("canCloseIdleAgent & getCloseAgentBlockedMessage cover all 5 groups and edge states", () => {
+  // Allowed: idle, reviewed done->idle, unknown->idle, manual/auto sleeping
+  assert.equal(canCloseIdleAgent({ group: "idle", rawStatus: "idle" }), true);
+  assert.equal(canCloseIdleAgent({ group: "idle", rawStatus: "done" }), true);
+  assert.equal(canCloseIdleAgent({ group: "idle", rawStatus: "unknown" }), true);
+  assert.equal(canCloseIdleAgent({ group: "sleeping", rawStatus: "idle" }), true);
+  assert.equal(canCloseIdleAgent({ group: "sleeping", rawStatus: "done" }), true);
+  assert.equal(canCloseIdleAgent({ group: "sleeping", rawStatus: "unknown" }), true);
+
+  // Disallowed: working, needs_you, review, plus defensive rawStatus working/blocked
+  assert.equal(canCloseIdleAgent({ group: "working", rawStatus: "working" }), false);
+  assert.equal(canCloseIdleAgent({ group: "needs_you", rawStatus: "blocked" }), false);
+  assert.equal(canCloseIdleAgent({ group: "review", rawStatus: "done" }), false);
+  assert.equal(canCloseIdleAgent({ group: "idle", rawStatus: "working" }), false);
+  assert.equal(canCloseIdleAgent({ group: "sleeping", rawStatus: "blocked" }), false);
+
+  assert.equal(
+    getCloseAgentBlockedMessage({ group: "working", rawStatus: "working" }),
+    "运行中的 Agent 不可一键关闭",
+  );
+  assert.equal(
+    getCloseAgentBlockedMessage({ group: "idle", rawStatus: "working" }),
+    "运行中的 Agent 不可一键关闭",
+  );
+  assert.equal(
+    getCloseAgentBlockedMessage({ group: "needs_you", rawStatus: "blocked" }),
+    "阻塞待审批的 Agent 不可一键关闭",
+  );
+  assert.equal(
+    getCloseAgentBlockedMessage({ group: "sleeping", rawStatus: "blocked" }),
+    "阻塞待审批的 Agent 不可一键关闭",
+  );
+  assert.equal(
+    getCloseAgentBlockedMessage({ group: "review", rawStatus: "done" }),
+    "待审阅的 Agent 请先按 [m] 标为已阅后再按 [X] 关闭",
+  );
+  assert.equal(
+    getCloseAgentBlockedMessage({ group: "idle", rawStatus: "idle" }),
+    "仅空闲或休眠中的 Agent 支持 [X] 一键关闭",
+  );
+});
+
+test("parseAgentGetCliJson, HerdrSocketClient.getAgent, & isAgentNotFoundError handle JSON shapes and error codes", async () => {
+  const sampleAgent: AgentInfo = {
+    pane_id: "w1:pA",
+    terminal_id: "term_1",
+    workspace_id: "w1",
+    tab_id: "w1:t1",
+    focused: false,
+    revision: 74,
+    agent: "agy",
+    agent_status: "done",
+    completion_seq: 1402,
+    state_change_seq: 1402,
+  };
+
+  assert.deepEqual(
+    parseAgentGetCliJson(JSON.stringify({ id: "cli:agent:get", result: { type: "agent_info", agent: sampleAgent } })),
+    sampleAgent,
+  );
+  assert.deepEqual(
+    parseAgentGetCliJson(JSON.stringify({ type: "agent_info", agent: sampleAgent })),
+    sampleAgent,
+  );
+  assert.deepEqual(
+    parseAgentGetCliJson(JSON.stringify({ result: sampleAgent })),
+    sampleAgent,
+  );
+  assert.deepEqual(
+    parseAgentGetCliJson(JSON.stringify(sampleAgent)),
+    sampleAgent,
+  );
+
+  // Socket client getAgent unwraps { type: "agent_info", agent } and tolerates unwrapped AgentInfo even when agent === "agy"
+  const socketClient = new HerdrSocketClient("/tmp/unused.sock");
+  (socketClient as unknown as { request: (m: string, p: Record<string, unknown>) => Promise<unknown> }).request = async (
+    method,
+    params,
+  ) => {
+    assert.equal(method, "agent.get");
+    assert.deepEqual(params, { target: "w1:pA" });
+    return { type: "agent_info", agent: sampleAgent };
+  };
+  assert.deepEqual(await socketClient.getAgent("w1:pA"), sampleAgent);
+
+  (socketClient as unknown as { request: () => Promise<unknown> }).request = async () => sampleAgent;
+  assert.deepEqual(await socketClient.getAgent("w1:pA"), sampleAgent);
+
+  // Socket client getAgent fails closed on empty / array / null / invalid payloads
+  for (const invalidPayload of [{}, [], null, { agent: "agy" }, { agent: { pane_id: "w1:pA" } }]) {
+    (socketClient as unknown as { request: () => Promise<unknown> }).request = async () => invalidPayload;
+    await assert.rejects(() => socketClient.getAgent("w1:pA"), /Invalid agent\.get RPC response/);
+  }
+
+  assert.throws(
+    () =>
+      parseAgentGetCliJson(
+        JSON.stringify({
+          error: { code: "agent_not_found", message: "agent target w1:p9 not found" },
+          id: "cli:agent:get",
+        }),
+      ),
+    (err: unknown) => err instanceof HerdrCliError && err.code === "agent_not_found" && isAgentNotFoundError(err),
+  );
+  assert.throws(() => parseAgentGetCliJson("{}"), /Invalid agent\.get CLI JSON/);
+  assert.throws(() => parseAgentGetCliJson("null"), /Invalid agent\.get CLI JSON/);
+  assert.throws(() => parseAgentGetCliJson("[]"), /Invalid agent\.get CLI JSON/);
+
+  assert.equal(isAgentNotFoundError(new HerdrRpcError("agent_not_found", "not found")), true);
+  assert.equal(isAgentNotFoundError(new HerdrRpcError("pane_not_found", "gone")), true);
+  assert.equal(isAgentNotFoundError(new HerdrRpcError("not_found", "missing")), true);
+  assert.equal(isAgentNotFoundError(new Error("no active agent in pane")), true);
+  assert.equal(isAgentNotFoundError(new Error("no agent")), true);
+  assert.equal(isAgentNotFoundError(new Error("agent target w1:p1 not found")), true);
+  assert.equal(isAgentNotFoundError(new Error("pane w1:p1 not found")), true);
+  assert.equal(isAgentNotFoundError(new Error("agent w1:p1 has exited")), true);
+  assert.equal(isAgentNotFoundError(new Error("ETIMEDOUT")), false);
+
+  // 5 adversarial negative cases that must NEVER be misclassified as agent_not_found / already_exited
+  const nonAgentNotFoundErrors = [
+    "zsh:1: command not found: herdr agent get w1:p1",
+    "sh: 1: herdr agent get w1:p1: not found",
+    "SSH authentication agent socket not found",
+    "error: machine 'agent-box' not found",
+    "error: socket not found for agent command",
+  ];
+  for (const msg of nonAgentNotFoundErrors) {
+    assert.equal(
+      isAgentNotFoundError(new Error(msg)),
+      false,
+      `expected isAgentNotFoundError false for: ${msg}`,
+    );
+    assert.equal(
+      classifyHerdrCliErrorCode(msg, "", msg),
+      "cli_error",
+      `expected classifyHerdrCliErrorCode "cli_error" for: ${msg}`,
+    );
+  }
+
+  // SSH warning banner preceding CLI JSON error still extracts structured error code
+  const sshPrefixedStderr =
+    "Warning: Permanently added '10.0.0.5' (ED25519) to the list of known hosts.";
+  const cliErrJson =
+    '{"error":{"code":"agent_not_found","message":"agent target w1:p1 not found"},"id":"cli:agent:get"}';
+  const sshCombined = `${sshPrefixedStderr}\n${cliErrJson}`;
+  assert.equal(
+    classifyHerdrCliErrorCode(sshCombined, cliErrJson, sshPrefixedStderr),
+    "agent_not_found",
+  );
+  assert.equal(
+    classifyHerdrCliErrorCode(sshCombined, "", sshCombined),
+    "agent_not_found",
+  );
+});
+
+test("closeIdleAgent orchestrates live pre-check, ctrl+d send (no pane.send_keys), concurrency lock, and fail-closed errors", async () => {
+  let paneSendKeysCalls = 0;
+
+  // 1) Local idle sends ctrl+d via sendAgentKeys only
+  {
+    const sent: Array<{ itemKey: string; keys: string[] }> = [];
+    const closingKeys = new Set<string>();
+    const item = makeDeckItem({ itemKey: "w1:p1", paneId: "w1:p1", group: "idle", rawStatus: "idle" });
+    const res = await closeIdleAgent(item, {
+      closingKeys,
+      getAgent: async () => ({ agent_status: "idle", completion_seq: null }),
+      sendAgentKeys: async (target, keys) => {
+        sent.push({ itemKey: target.itemKey, keys });
+      },
+    });
+    assert.deepEqual(res, { outcome: "sent" });
+    assert.deepEqual(sent, [{ itemKey: "w1:p1", keys: [CLOSE_AGENT_KEY] }]);
+    assert.equal(closingKeys.size, 0);
+    assert.equal(paneSendKeysCalls, 0);
+  }
+
+  // 2) Remote sleeping sends ctrl+d
+  {
+    const sent: Array<{ machineId?: string | null; paneId: string; keys: string[] }> = [];
+    const closingKeys = new Set<string>();
+    const item = makeDeckItem({
+      itemKey: "m-tokyo::w2:p3",
+      machineId: "m-tokyo",
+      machineLabel: "soltokyo",
+      paneId: "w2:p3",
+      group: "sleeping",
+      sleepReason: "auto",
+      rawStatus: "idle",
+    });
+    const res = await closeIdleAgent(item, {
+      closingKeys,
+      getAgent: async () => ({ agent_status: "idle", completion_seq: 12 }),
+      sendAgentKeys: async (target, keys) => {
+        sent.push({ machineId: target.machineId, paneId: target.paneId, keys });
+      },
+    });
+    assert.deepEqual(res, { outcome: "sent" });
+    assert.deepEqual(sent, [{ machineId: "m-tokyo", paneId: "w2:p3", keys: ["ctrl+d"] }]);
+  }
+
+  // 3) Reviewed item (rawStatus: "done", group: "idle", unchanged completion_seq) is allowed
+  {
+    let sendCount = 0;
+    const item = makeDeckItem({
+      group: "idle",
+      rawStatus: "done",
+      effectiveStatus: "idle",
+      completionSeq: 7,
+    });
+    const res = await closeIdleAgent(item, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: "done", completion_seq: 7 }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.deepEqual(res, { outcome: "sent" });
+    assert.equal(sendCount, 1);
+  }
+
+  // 4) Live pre-check detects status changed to working / blocked / newer completion_seq -> aborts without sending
+  for (const [live, expectedStatus] of [
+    [{ agent_status: "working" as const, completion_seq: null }, "working"],
+    [{ agent_status: "blocked" as const, completion_seq: null }, "blocked"],
+    [{ agent_status: "done" as const, completion_seq: 8 }, "done"],
+  ] as const) {
+    let sendCount = 0;
+    const item = makeDeckItem({
+      group: "idle",
+      rawStatus: "done",
+      effectiveStatus: "idle",
+      completionSeq: 7,
+    });
+    const res = await closeIdleAgent(item, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => live,
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.deepEqual(res, { outcome: "status_changed", liveStatus: expectedStatus });
+    assert.equal(sendCount, 0);
+  }
+
+  // 4b) Idle item with null completionSeq aborts if live turns done (with or without completion_seq)
+  {
+    let sendCount = 0;
+    const item = makeDeckItem({ group: "idle", rawStatus: "idle", completionSeq: null });
+    const resWithSeq = await closeIdleAgent(item, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: "done", completion_seq: 1 }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.deepEqual(resWithSeq, { outcome: "status_changed", liveStatus: "done" });
+
+    const resWithoutSeq = await closeIdleAgent(item, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: "done", completion_seq: null }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.deepEqual(resWithoutSeq, { outcome: "status_changed", liveStatus: "done" });
+    assert.equal(sendCount, 0);
+  }
+
+  // 4c) Reviewed item (rawStatus: "done", group: "idle") aborts when unseq done advances revision or drops completion_seq
+  {
+    let sendCount = 0;
+    const unseqReviewed = makeDeckItem({
+      group: "idle",
+      rawStatus: "done",
+      effectiveStatus: "idle",
+      completionSeq: null,
+      revision: 10,
+    });
+    const resSameRev = await closeIdleAgent(unseqReviewed, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: "done", completion_seq: null, revision: 10 }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.deepEqual(resSameRev, { outcome: "sent" });
+    assert.equal(sendCount, 1);
+
+    const resHigherRev = await closeIdleAgent(unseqReviewed, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: "done", completion_seq: null, revision: 11 }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.deepEqual(resHigherRev, { outcome: "status_changed", liveStatus: "done" });
+
+    const seqReviewed = makeDeckItem({
+      group: "idle",
+      rawStatus: "done",
+      effectiveStatus: "idle",
+      completionSeq: 7,
+      revision: 10,
+    });
+    const resDroppedSeq = await closeIdleAgent(seqReviewed, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: "done", completion_seq: null, revision: 10 }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.deepEqual(resDroppedSeq, { outcome: "status_changed", liveStatus: "done" });
+    assert.equal(sendCount, 1);
+  }
+
+  // 4d) Unrecognized / missing live agent_status fails closed -> error without sending ctrl+d
+  for (const weirdStatus of [undefined, "paused", "initializing"] as const) {
+    let sendCount = 0;
+    const res = await closeIdleAgent(makeDeckItem(), {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: weirdStatus as unknown as AgentInfo["agent_status"], completion_seq: null }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.equal(res.outcome, "error");
+    assert.equal(sendCount, 0);
+  }
+
+  // 4e) onSent runs synchronously before closingKeys is released (zero-gap cooldown handoff)
+  {
+    const closingKeys = new Set<string>();
+    const item = makeDeckItem({ itemKey: "w1:p_handoff" });
+    let sawLockActiveInOnSent = false;
+    const res = await closeIdleAgent(item, {
+      closingKeys,
+      getAgent: async () => ({ agent_status: "idle", completion_seq: null }),
+      sendAgentKeys: async () => {},
+      onSent: (sentItem) => {
+        sawLockActiveInOnSent = closingKeys.has(sentItem.itemKey);
+      },
+    });
+    assert.deepEqual(res, { outcome: "sent" });
+    assert.equal(sawLockActiveInOnSent, true);
+    assert.equal(closingKeys.has(item.itemKey), false);
+  }
+
+  // 5) Pre-check or sendAgentKeys returns agent_not_found -> already_exited, zero pane.send_keys fallback
+  {
+    let sendCount = 0;
+    const item = makeDeckItem();
+    const resPre = await closeIdleAgent(item, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => {
+        throw new HerdrRpcError("agent_not_found", "agent target w1:p1 not found");
+      },
+      sendAgentKeys: async () => {
+        sendCount += 1;
+        paneSendKeysCalls += 1;
+      },
+    });
+    assert.deepEqual(resPre, { outcome: "already_exited" });
+    assert.equal(sendCount, 0);
+    assert.equal(paneSendKeysCalls, 0);
+
+    const resSend = await closeIdleAgent(item, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => ({ agent_status: "idle", completion_seq: null }),
+      sendAgentKeys: async () => {
+        throw new HerdrCliError("agent_not_found", "agent target w1:p1 not found");
+      },
+    });
+    assert.deepEqual(resSend, { outcome: "already_exited" });
+    assert.equal(paneSendKeysCalls, 0);
+  }
+
+  // 6) Live pre-check transient / network error -> fail-closed error, never blindly sends ctrl+d
+  {
+    let sendCount = 0;
+    const item = makeDeckItem();
+    const res = await closeIdleAgent(item, {
+      closingKeys: new Set<string>(),
+      getAgent: async () => {
+        throw new Error("Herdr socket request timed out: agent.get");
+      },
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    assert.equal(res.outcome, "error");
+    assert.match((res as { outcome: "error"; message: string }).message, /timed out/);
+    assert.equal(sendCount, 0);
+  }
+
+  // 7) Concurrent re-entrancy on same itemKey -> second returns in_flight, only 1 ctrl+d sent
+  {
+    const closingKeys = new Set<string>();
+    let releaseGet!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGet = resolve;
+    });
+    let sendCount = 0;
+    const item = makeDeckItem({ itemKey: "w1:p_dup" });
+
+    const p1 = closeIdleAgent(item, {
+      closingKeys,
+      getAgent: async () => {
+        await gate;
+        return { agent_status: "idle", completion_seq: null };
+      },
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+    const p2 = closeIdleAgent(item, {
+      closingKeys,
+      getAgent: async () => ({ agent_status: "idle", completion_seq: null }),
+      sendAgentKeys: async () => {
+        sendCount += 1;
+      },
+    });
+
+    assert.deepEqual(await p2, { outcome: "in_flight" });
+    releaseGet();
+    assert.deepEqual(await p1, { outcome: "sent" });
+    assert.equal(sendCount, 1);
+    assert.equal(closingKeys.size, 0);
+  }
+
+  // 8) Blocked by state returns blocked_by_state without calling getAgent or sendAgentKeys
+  {
+    let getCalled = 0;
+    let sendCalled = 0;
+    const res = await closeIdleAgent(
+      makeDeckItem({ group: "review", rawStatus: "done", effectiveStatus: "done" }),
+      {
+        closingKeys: new Set<string>(),
+        getAgent: async () => {
+          getCalled += 1;
+          return { agent_status: "done", completion_seq: 1 };
+        },
+        sendAgentKeys: async () => {
+          sendCalled += 1;
+        },
+      },
+    );
+    assert.deepEqual(res, {
+      outcome: "blocked_by_state",
+      message: "待审阅的 Agent 请先按 [m] 标为已阅后再按 [X] 关闭",
+    });
+    assert.equal(getCalled, 0);
+    assert.equal(sendCalled, 0);
+  }
+});
+
+test("resolveSelectionAfterRemoval handles middle, last, single, and surviving items", () => {
+  assert.equal(resolveSelectionAfterRemoval(["a", "b", "c"], "b", ["a", "c"]), "c");
+  assert.equal(resolveSelectionAfterRemoval(["a", "b", "c"], "c", ["a", "b"]), "b");
+  assert.equal(resolveSelectionAfterRemoval(["a"], "a", []), null);
+  assert.equal(resolveSelectionAfterRemoval(["a", "b"], "a", ["a", "b"]), "a");
+  assert.equal(resolveSelectionAfterRemoval(["b"], "a", ["b", "c"]), "b");
+});
+
+test("parseTerminalInput parses uppercase X as char X", () => {
+  const events = parseTerminalInput(Buffer.from("X"));
+  assert.deepEqual(events, [{ kind: "char", value: "X" }]);
+  assert.equal(toHerdrKeySpec(events[0]!), "X");
+});
+
+test("renderScreen renders [X] 关闭 contextually for local/remote idle & sleeping items and keeps 26-row cheatsheet border intact", () => {
+  const cols = 112;
+  const rows = 26;
+  const extractRows = (frame: string): string[] =>
+    [...frame.matchAll(/\x1b\[(\d+);1H([\s\S]*?)\x1b\[K/g)].map((m) => stripAnsi(m[2]!));
+
+  const localIdle = makeDeckItem({ itemKey: "w1:p1", paneId: "w1:p1", group: "idle", rawStatus: "idle" });
+  const remoteSleeping = makeDeckItem({
+    itemKey: "m-tokyo::w1:p2",
+    machineId: "m-tokyo",
+    machineLabel: "soltokyo",
+    paneId: "w1:p2",
+    paneLabel: "sleep-remote",
+    primaryTitle: "sleep-remote",
+    group: "sleeping",
+    sleepReason: "manual",
+    rawStatus: "idle",
+  });
+  const workingItem = makeDeckItem({
+    itemKey: "w1:p3",
+    paneId: "w1:p3",
+    paneLabel: "worker",
+    primaryTitle: "worker",
+    group: "working",
+    rawStatus: "working",
+    effectiveStatus: "working",
+  });
+  const blockedItem = makeDeckItem({
+    itemKey: "w1:p4",
+    paneId: "w1:p4",
+    paneLabel: "blocker",
+    primaryTitle: "blocker",
+    group: "needs_you",
+    rawStatus: "blocked",
+    effectiveStatus: "blocked",
+  });
+
+  const baseState = {
+    cols,
+    rows,
+    items: [blockedItem, workingItem, localIdle, remoteSleeping],
+    selectedItemKey: localIdle.itemKey,
+    focusMode: "list" as const,
+    filterTab: "all" as const,
+    showIdle: true,
+    showSleeping: true,
+    showHelp: false,
+    previewText: "Ready.",
+    replyDraft: "",
+    replyCursor: 0,
+    renameDraft: "",
+    renameCursor: 0,
+    toastMessage: null,
+    toastKind: "info" as const,
+    spinnerTick: 0,
+    nowMs: 10_000,
+  };
+
+  // 1) Local idle selected -> shows [X] 关闭 in inline box & footer bar
+  const localLines = extractRows(renderScreen(baseState));
+  assert.equal(localLines.length, rows);
+  for (const [idx, line] of localLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `localIdle row ${idx} width mismatch: "${line}"`);
+  }
+  const localText = localLines.join("\n");
+  assert.ok(localText.includes("[r] 输入 · [R] 重命名 · [X] 关闭 · [Enter] 进终端"));
+  assert.ok(localText.includes("[X] 关闭"));
+  assert.ok(!localLines[rows - 1]!.includes("[y/n] 审批"));
+
+  // 2) Remote sleeping selected -> shows [X] 关闭 + remote hint in inline box & footer bar
+  const remoteLines = extractRows(renderScreen({ ...baseState, selectedItemKey: remoteSleeping.itemKey }));
+  assert.equal(remoteLines.length, rows);
+  for (const [idx, line] of remoteLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `remoteSleeping row ${idx} width mismatch: "${line}"`);
+  }
+  const remoteText = remoteLines.join("\n");
+  assert.ok(remoteText.includes("[r] 输入 · [R] 重命名 · [X] 关闭 · 远端仅原地操作"));
+  assert.ok(remoteLines[rows - 1]!.includes("[X] 关闭"));
+
+  // 3) Working & needs_you selected -> do NOT show [X] 关闭
+  for (const nonClosable of [workingItem, blockedItem]) {
+    const lines = extractRows(renderScreen({ ...baseState, selectedItemKey: nonClosable.itemKey }));
+    assert.equal(lines.length, rows);
+    for (const [idx, line] of lines.entries()) {
+      assert.equal(visibleWidth(line), cols, `nonClosable row ${idx} width mismatch: "${line}"`);
+    }
+    const txt = lines.join("\n");
+    assert.ok(!txt.includes("[X] 关闭"), `${nonClosable.group} should not show [X] 关闭`);
+    assert.ok(lines[rows - 1]!.includes("[y/n] 审批"));
+  }
+
+  // 4) Cheatsheet at rows = 26 includes X (Shift+x) AND keeps full bottom rounded border intact
+  const helpLines = extractRows(renderScreen({ ...baseState, showHelp: true }));
+  assert.equal(helpLines.length, rows);
+  for (const [idx, line] of helpLines.entries()) {
+    assert.equal(visibleWidth(line), cols, `help row ${idx} width mismatch: "${line}"`);
+  }
+  const helpBody = helpLines.slice(1, rows - 1);
+  assert.ok(helpBody.some((l) => l.includes("X (Shift+x)") && l.includes("关闭空闲 / 休眠 Agent")));
+  assert.ok(helpBody.some((l) => l.includes("╭") && l.includes("╮")), "expected cheatsheet top border");
+  assert.ok(helpBody.some((l) => l.includes("╰") && l.includes("╯")), "expected cheatsheet bottom border");
+
+  // 5) Mid-width default cols = 100 & narrow split cols = 82 preserve [X] 关闭 in inline rightTag
+  for (const testCols of [100, 82]) {
+    const localMidLines = extractRows(renderScreen({ ...baseState, cols: testCols, selectedItemKey: localIdle.itemKey }));
+    assert.equal(localMidLines.length, rows);
+    for (const [idx, line] of localMidLines.entries()) {
+      assert.equal(visibleWidth(line), testCols, `cols=${testCols} local row ${idx} width mismatch: "${line}"`);
+    }
+    assert.ok(localMidLines.join("\n").includes("[X] 关闭"), `expected [X] 关闭 in cols=${testCols} local frame`);
+
+    const remoteMidLines = extractRows(
+      renderScreen({ ...baseState, cols: testCols, selectedItemKey: remoteSleeping.itemKey }),
+    );
+    assert.equal(remoteMidLines.length, rows);
+    for (const [idx, line] of remoteMidLines.entries()) {
+      assert.equal(visibleWidth(line), testCols, `cols=${testCols} remote row ${idx} width mismatch: "${line}"`);
+    }
+    assert.ok(remoteMidLines.join("\n").includes("[X] 关闭"), `expected [X] 关闭 in cols=${testCols} remote frame`);
+  }
+});
+
+test("reconcileTimersWithSnapshot prunes timers when agent exits while pane/shell stays open (local and remote)", () => {
+  const now = 1_700_600_000_000;
+  const state = createEmptyState();
+  state.timers["w1:p_kept"] = {
+    status: "idle",
+    sinceMs: now - 3600_000,
+    sleeping: true,
+    sleepingSinceMs: now - 1800_000,
+    seenCompletionSeq: 9,
+  };
+  state.timers[makeAgentTimerKey("w2:p_kept", "m-tokyo")] = {
+    status: "idle",
+    sinceMs: now - 7200_000,
+    sleeping: true,
+    sleepingSinceMs: now - 3600_000,
+    seenCompletionSeq: 4,
+  };
+
+  // Pane remains in snapshot.panes (shell kept open), but agent exited (absent from snapshot.agents)
+  const localPaneKeptSnap: SessionSnapshot = {
+    version: "0.9.5",
+    protocol: 22,
+    workspaces: [
+      {
+        workspace_id: "w1",
+        number: 1,
+        label: "misc",
+        focused: true,
+        pane_count: 1,
+        tab_count: 1,
+        active_tab_id: "w1:t1",
+        agent_status: "idle",
+      },
+    ],
+    tabs: [
+      { tab_id: "w1:t1", workspace_id: "w1", number: 1, label: "main", focused: true, pane_count: 1, agent_status: "idle" },
+    ],
+    panes: [
+      { pane_id: "w1:p_kept", terminal_id: "t1", workspace_id: "w1", tab_id: "w1:t1", focused: true, revision: 5, agent_status: "idle" },
+    ],
+    agents: [],
+  };
+  const remotePaneKeptSnap: SessionSnapshot = {
+    ...localPaneKeptSnap,
+    workspaces: [{ ...localPaneKeptSnap.workspaces[0]!, workspace_id: "w2" }],
+    tabs: [{ ...localPaneKeptSnap.tabs[0]!, tab_id: "w2:t1", workspace_id: "w2" }],
+    panes: [{ ...localPaneKeptSnap.panes[0]!, pane_id: "w2:p_kept", workspace_id: "w2", tab_id: "w2:t1" }],
+    agents: [],
+  };
+
+  assert.equal(reconcileTimersWithSnapshot(state, localPaneKeptSnap, now, null), true);
+  assert.equal(state.timers["w1:p_kept"], undefined);
+  assert.ok(state.timers[makeAgentTimerKey("w2:p_kept", "m-tokyo")], "local reconcile must not prune remote timer");
+
+  assert.equal(reconcileTimersWithSnapshot(state, remotePaneKeptSnap, now, "m-tokyo"), true);
+  assert.equal(state.timers[makeAgentTimerKey("w2:p_kept", "m-tokyo")], undefined);
 });

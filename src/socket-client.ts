@@ -1,7 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { PaneReadResult, SessionSnapshot } from "./types.ts";
+import type { AgentInfo, PaneReadResult, SessionSnapshot } from "./types.ts";
 
 export function resolveSocketPath(): string {
   if (process.env.HERDR_SOCKET_PATH) {
@@ -145,6 +145,30 @@ export class HerdrSocketClient {
       return res.read;
     }
     return res as unknown as PaneReadResult;
+  }
+
+  async getAgent(target: string): Promise<AgentInfo> {
+    const res = await this.request<{ agent?: AgentInfo } & Partial<AgentInfo>>("agent.get", {
+      target,
+    });
+    const candidate =
+      res &&
+      typeof res === "object" &&
+      !Array.isArray(res) &&
+      res.agent &&
+      typeof res.agent === "object" &&
+      !Array.isArray(res.agent)
+        ? res.agent
+        : res;
+    if (
+      !candidate ||
+      typeof candidate !== "object" ||
+      Array.isArray(candidate) ||
+      typeof candidate.agent_status !== "string"
+    ) {
+      throw new Error("Invalid agent.get RPC response");
+    }
+    return candidate as AgentInfo;
   }
 
   async sendAgentKeys(target: string, keys: string[]): Promise<void> {

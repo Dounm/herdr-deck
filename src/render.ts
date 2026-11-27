@@ -11,6 +11,7 @@ import {
   visibleWidth,
   wrapAnsiLine,
 } from "./ansi.ts";
+import { canCloseIdleAgent } from "./close-agent.ts";
 import { formatDurationCompact, formatRelativeAge } from "./state.ts";
 import { DEFAULT_THEME, type DeckTheme } from "./theme.ts";
 import type { AttentionGroup, DeckAgentItem, GitRepoInfo } from "./types.ts";
@@ -771,6 +772,18 @@ function renderPreviewCard(
   return out;
 }
 
+function pickFittingRightTag(candidates: string[], title: string, width: number): string {
+  const innerBudget = width - 2;
+  const leftW = title ? visibleWidth(`─ ${title} `) : 0;
+  for (const candidate of candidates) {
+    const rightW = visibleWidth(` ${candidate} ─`);
+    if (leftW + rightW + 1 <= innerBudget) {
+      return candidate;
+    }
+  }
+  return candidates[candidates.length - 1] ?? "";
+}
+
 function renderInlineReplyCard(
   state: RenderState,
   selected: DeckAgentItem | null,
@@ -804,6 +817,7 @@ function renderInlineReplyCard(
         : `${theme.fgSecondary}快速回复${RESET}`;
 
   const isRemote = Boolean(selected?.machineId);
+  const canClose = selected !== null && canCloseIdleAgent(selected);
   const rightTag = isRename
     ? `${theme.fgMuted}Enter 保存 · 留空清除 · Esc 取消${RESET}`
     : isReply
@@ -812,9 +826,27 @@ function renderInlineReplyCard(
         ? isRemote
           ? `${theme.fgMuted}[y/n/1-4] 审批 · [r] 回复${RESET}`
           : `${theme.fgMuted}[y/n/1-4] 审批 · [Enter] 进终端${RESET}`
-        : isRemote
-          ? `${theme.fgMuted}[r] 输入 · [R] 重命名 · 远端仅原地操作${RESET}`
-          : `${theme.fgMuted}[r] 输入 · [R] 重命名 · [Enter] 进终端${RESET}`;
+        : canClose
+          ? pickFittingRightTag(
+              isRemote
+                ? [
+                    `${theme.fgMuted}[r] 输入 · [R] 重命名 · [X] 关闭 · 远端仅原地操作${RESET}`,
+                    `${theme.fgMuted}[r] 回复 · [X] 关闭 · 远端仅原地操作${RESET}`,
+                    `${theme.fgMuted}[r] 回复 · [X] 关闭${RESET}`,
+                    `${theme.fgMuted}[X] 关闭${RESET}`,
+                  ]
+                : [
+                    `${theme.fgMuted}[r] 输入 · [R] 重命名 · [X] 关闭 · [Enter] 进终端${RESET}`,
+                    `${theme.fgMuted}[r] 回复 · [X] 关闭 · [Enter] 进终端${RESET}`,
+                    `${theme.fgMuted}[r] 回复 · [X] 关闭${RESET}`,
+                    `${theme.fgMuted}[X] 关闭${RESET}`,
+                  ],
+              title,
+              width,
+            )
+          : isRemote
+            ? `${theme.fgMuted}[r] 输入 · [R] 重命名 · 远端仅原地操作${RESET}`
+            : `${theme.fgMuted}[r] 输入 · [R] 重命名 · [Enter] 进终端${RESET}`;
 
   let content = "";
   let rowBg: string | undefined = canvasBg || undefined;
@@ -905,6 +937,7 @@ function renderCheatsheetBody(cols: number, height: number, theme: DeckTheme): s
       heading: "队列管理",
       rows: [
         ["R (Shift+r)", "原地重命名选中 Pane（留空回车清除名称）"],
+        ["X (Shift+x)", "关闭空闲 / 休眠 Agent（发 Ctrl+D，保留 Pane）"],
         ["m / Space", "将「待审阅」项标记为已阅并移向下一待办"],
         ["f", "循环切换过滤视图（全部 / 仅待办 / 活跃）"],
         ["z", "展开或隐藏 IDLE 空闲分组"],
@@ -1013,11 +1046,17 @@ function renderFooterBar(state: RenderState, cols: number, theme: DeckTheme): st
       ["Esc", "取消"],
     ];
   } else {
+    const visibleItems = getVisibleItems(state);
+    const selected =
+      visibleItems.find((x) => x.itemKey === state.selectedItemKey) ??
+      visibleItems[0] ??
+      null;
+    const canCloseSelected = selected !== null && canCloseIdleAgent(selected);
     hints = [
       ["j/k", "切换"],
       ["Enter", "进入终端"],
       ["r", "回复"],
-      ["y/n", "审批"],
+      canCloseSelected ? ["X", "关闭"] : ["y/n", "审批"],
       ["m", "已阅"],
       ["?", "全部快捷键"],
     ];
